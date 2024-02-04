@@ -971,6 +971,7 @@ to the above explanation."
                          #'display-buffer-below-selected)))))
     req))
 
+;; later versions of jupyter-eval-region include additional first param `insert'
 (defun jupyter-eval-region (beg end &optional cb)
   "Evaluate a region with the `jupyter-current-client'.
 BEG and END are the beginning and end of the region to evaluate.

@@ -727,7 +727,7 @@ Similarly, associate the same value for LANG in
                        (cdr (assoc lang org-babel-tangle-lang-exts)))))
   (add-to-list 'org-src-lang-modes
                (cons (concat "jupyter-" lang)
-                     (or (cdr (assoc lang org-src-lang-modes))
+                     (or (car (assoc lang org-src-lang-modes))
                          (intern (downcase (replace-regexp-in-string
                                             "[0-9]*" "" lang)))))))
 

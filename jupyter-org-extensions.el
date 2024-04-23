@@ -1,14 +1,13 @@
 ;;; jupyter-org-extensions.el --- Jupyter Org Extensions -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2018 Nathaniel Nicandro
+;; Copyright (C) 2018-2024 Nathaniel Nicandro
 
 ;; Author: Carlos Garcia C. <carlos@binarycharly.com>
 ;; Created: 01 March 2019
-;; Version: 0.8.0
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
-;; published by the Free Software Foundation; either version 2, or (at
+;; published by the Free Software Foundation; either version 3, or (at
 ;; your option) any later version.
 
 ;; This program is distributed in the hope that it will be useful, but
@@ -28,7 +27,9 @@
 
 ;;; Code:
 
+(require 'jupyter-kernelspec)
 (require 'jupyter-org-client)
+(eval-when-compile (require 'subr-x))
 
 (declare-function org-babel-jupyter-initiate-session "ob-jupyter" (&optional session params))
 (declare-function org-babel-jupyter-src-block-session "ob-jupyter" ())
@@ -36,10 +37,13 @@
 (declare-function org-in-src-block-p "org" (&optional inside))
 (declare-function org-narrow-to-subtree "org" ())
 (declare-function org-previous-line-empty-p "org" ())
+(declare-function org-show-context "org" (&optional key))
 (declare-function org-next-line-empty-p "org" ())
 (declare-function org-element-context "org-element" (&optional element))
+(declare-function org-element-type "org-element" (element))
 (declare-function org-element-property "org-element" (property element))
 (declare-function org-element-interpret-data "org-element" (data))
+(declare-function org-element-at-point "org-element" ())
 (declare-function org-element-put-property "org-element" (element property value))
 (declare-function outline-show-entry "outline" ())
 (declare-function avy-jump "ext:avy")
@@ -54,55 +58,80 @@ beginning of a source block in a list."
 
 (defun jupyter-org-closest-jupyter-language (&optional query)
   "Return the language of the closest Jupyter source block.
-If QUERY is non-nil, ask for a language to use instead. Asking
+If QUERY is non-nil, ask for a language to use instead.  Asking
 for which language to use is also done if no Jupyter source
 blocks could be found in the buffer.
 
-Distance is line based, not character based. Also, `point' is
+Distance is line based, not character based.  Also, `point' is
 assumed to not be inside a source block."
-  (save-excursion
-    (or (and (null query)
-             (cl-loop
-              with start = (line-number-at-pos)
-              with previous = (ignore-errors
-                                (save-excursion
-                                  (org-babel-previous-src-block)
-                                  (point)))
-              with next = (ignore-errors
-                            (save-excursion
-                              (org-babel-next-src-block)
-                              (point)))
-              with maybe-return-lang =
-              (lambda ()
-                (let ((info (org-babel-get-src-block-info 'light)))
-                  (when (org-babel-jupyter-language-p (nth 0 info))
-                    (cl-return (nth 0 info)))))
-              while (or previous next) do
-              (cond
-               ((or
-                 ;; Maybe return the previous Jupyter source block's language
-                 ;; if it is closer to the start point than the next source
-                 ;; block
-                 (and previous next (< (- start (line-number-at-pos previous))
-                                       (- (line-number-at-pos next) start)))
-                 ;; or when there is no next source block
-                 (and (null next) previous))
-                (goto-char previous)
-                (funcall maybe-return-lang)
-                (setq previous (ignore-errors
-                                 (org-babel-previous-src-block)
-                                 (point))))
-               (next
-                (goto-char next)
-                (funcall maybe-return-lang)
-                (setq next (ignore-errors
-                             (org-babel-next-src-block)
-                             (point)))))))
+  (org-save-outline-visibility nil
+    (or (save-excursion
+          (and (null query)
+               (cl-loop
+                with start = (line-number-at-pos)
+                with previous = (ignore-errors
+                                  (save-excursion
+                                    (org-babel-previous-src-block)
+                                    (point)))
+                with next = (ignore-errors
+                              (save-excursion
+                                (org-babel-next-src-block)
+                                (point)))
+                with maybe-return-lang =
+                (lambda ()
+                  (let ((info (org-babel-get-src-block-info 'light)))
+                    (when (org-babel-jupyter-language-p (nth 0 info))
+                      (cl-return (nth 0 info)))))
+                while (or previous next) do
+                (cond
+                 ((or
+                   ;; Maybe return the previous Jupyter source block's language
+                   ;; if it is closer to the start point than the next source
+                   ;; block
+                   (and previous next (< (- start (line-number-at-pos previous))
+                                         (- (line-number-at-pos next) start)))
+                   ;; or when there is no next source block
+                   (and (null next) previous))
+                  (goto-char previous)
+                  (funcall maybe-return-lang)
+                  (setq previous (ignore-errors
+                                   (org-babel-previous-src-block)
+                                   (point))))
+                 (next
+                  (goto-char next)
+                  (funcall maybe-return-lang)
+                  (setq next (ignore-errors
+                               (org-babel-next-src-block)
+                               (point))))))))
         ;; If all else fails, query for the language to use
         (let* ((kernelspec (jupyter-completing-read-kernelspec))
-               (lang (plist-get (cddr kernelspec) :language)))
+               (lang (plist-get
+                      (jupyter-kernelspec-plist kernelspec)
+                      :language)))
           (if (org-babel-jupyter-language-p lang) lang
             (format "jupyter-%s" lang))))))
+
+(defun jupyter-org-between-block-end-and-result-p ()
+  "If `point' is between a src-block and its result, return the result end.
+`point' is considered between a src-block and its result when the
+result begins where the src-block ends, i.e. when only whitespace
+separates the two."
+  ;; Move after a src block's results first if `point' is between a src
+  ;; block and it's results.  Don't do this if the results are not directly
+  ;; after a src block, e.g. for named results that appear somewhere else.
+  (save-excursion
+    (let ((start (point)))
+      (when-let* ((src (and (org-save-outline-visibility nil
+                              (ignore-errors (org-babel-previous-src-block)))
+                            (org-element-context)))
+                  (end (org-element-property :end src))
+                  (result-pos (org-babel-where-is-src-block-result)))
+        (goto-char end)
+        (skip-chars-backward " \n\t\r")
+        (when (and (= result-pos end)
+                   (< (point) start result-pos))
+          (goto-char result-pos)
+          (org-element-property :end (org-element-context)))))))
 
 ;;;###autoload
 (defun jupyter-org-insert-src-block (&optional below query)
@@ -113,7 +142,7 @@ If `point' is in a src-block use the language of the src-block and
 copy the header to the new block.
 
 If QUERY is non-nil and `point' is not in a src-block, ask for
-the language to use for the new block. Otherwise try to select a
+the language to use for the new block.  Otherwise try to select a
 language based on the src-block's near `point'."
   (interactive (list current-prefix-arg nil))
   (if (org-in-src-block-p)
@@ -122,16 +151,17 @@ language based on the src-block's near `point'."
              (end (org-element-property :end src))
              (lang (org-element-property :language src))
              (switches (org-element-property :switches src))
-             (parameters (org-element-property :parameters src))
-             location)
+             (parameters (org-element-property :parameters src)))
         (if below
-            (progn
-              (goto-char start)
-              (setq location (org-babel-where-is-src-block-result))
+            (let ((location (progn
+                              (goto-char start)
+                              (org-babel-where-is-src-block-result))))
               (if (not location)
                   (goto-char end)
                 (goto-char location)
                 (goto-char (org-element-property :end (org-element-context))))
+              (unless (org-previous-line-empty-p)
+                (insert "\n"))
               (insert
                (org-element-interpret-data
                 (org-element-put-property
@@ -140,6 +170,8 @@ language based on the src-block's near `point'."
               (forward-line -3))
           ;; after current block
           (goto-char (org-element-property :begin src))
+          (unless (org-previous-line-empty-p)
+            (insert "\n"))
           (insert
            (org-element-interpret-data
             (org-element-put-property
@@ -147,9 +179,29 @@ language based on the src-block's near `point'."
              :post-blank 1)))
           (forward-line -3)))
     ;; not in a src block, insert a new block, query for jupyter kernel
+    (beginning-of-line)
     (let* ((lang (jupyter-org-closest-jupyter-language query))
            (src-block (jupyter-org-src-block lang nil "\n")))
-      (beginning-of-line)
+      (when-let* ((pos (jupyter-org-between-block-end-and-result-p)))
+        (goto-char pos)
+        (skip-chars-backward " \n\t\r"))
+      (unless (looking-at-p "^[\t ]*$")
+        ;; Move past the current element first
+        (let ((elem (org-element-at-point)) parent)
+          (while (and (setq parent (org-element-property :parent elem))
+                      (not (memq (org-element-type parent)
+                                 '(inlinetask))))
+            (setq elem parent))
+          (when elem
+            (goto-char (org-element-property
+                        (if below :end :begin) elem))))
+        (cond
+         (below
+          (skip-chars-backward " \n\t\r")
+          (insert "\n"))
+         (t
+          (insert "\n")
+          (forward-line -1))))
       (unless (or (bobp) (org-previous-line-empty-p))
         (insert "\n"))
       (insert (string-trim-right (org-element-interpret-data src-block)))
@@ -208,18 +260,18 @@ The session is selected in the following way:
 
    * If `point' is not at a Jupyter source block, examine the
      source blocks before `point' and ask the user to select a
-     session if multiple exist. If there is only one session, use
+     session if multiple exist.  If there is only one session, use
      it without asking.
 
    * Finally, if a session could not be found, then no Jupyter
-     source blocks exist before `point'. In this case, no session
+     source blocks exist before `point'.  In this case, no session
      is selected and all the source blocks before `point' will be
      evaluated, e.g. when all source blocks before `point' are
      shell source blocks.
 
 NOTE: If a session could be selected, only Jupyter source blocks
 that have the same session are evaluated *without* evaluating any
-other source blocks. You can also evaluate ANY source block that
+other source blocks.  You can also evaluate ANY source block that
 doesn't have a Jupyter session by providing a prefix argument.
 This is useful, e.g. to evaluate shell source blocks along with
 Jupyter source blocks."
@@ -252,7 +304,7 @@ Jupyter source blocks."
         ;; block.
         ;;
         ;; If a Jupyter based SESSION could be found, only source blocks that
-        ;; have a Jupyter session matching SESSION are evaluated. When a source
+        ;; have a Jupyter session matching SESSION are evaluated.  When a source
         ;; block doesn't have a Jupyter session, it is only evaluated when ANY
         ;; is non-nil.
         (when (or (null session)
@@ -267,12 +319,41 @@ Jupyter source blocks."
 (defun jupyter-org-execute-subtree (any)
   "Execute Jupyter source blocks that start before point in the current subtree.
 This function narrows the buffer to the current subtree and calls
-`jupyter-org-execute-to-point'. See that function for the meaning
+`jupyter-org-execute-to-point'.  See that function for the meaning
 of the ANY argument."
   (interactive "P")
   (save-restriction
     (org-narrow-to-subtree)
     (jupyter-org-execute-to-point any)))
+
+;;;###autoload
+(defun jupyter-org-next-busy-src-block (arg &optional backward)
+  "Jump to the next busy source block.
+
+With a prefix argument ARG, jump forward ARG many blocks.
+
+When BACKWARD is non-nil, jump to the previous block."
+  (interactive "p")
+  (org-save-outline-visibility nil
+    (cl-loop
+     with count = (abs (or arg 1))
+     with origin = (point)
+     while (ignore-errors
+             (if backward (org-babel-previous-src-block)
+               (org-babel-next-src-block)))
+     thereis (when (jupyter-org-request-at-point)
+               (zerop (cl-decf count)))
+     finally (goto-char origin)
+     (user-error "No %s busy code blocks" (if backward "previous" "further"))))
+  (save-match-data (org-show-context)))
+
+;;;###autoload
+(defun jupyter-org-previous-busy-src-block (arg)
+  "Jump to the previous busy source block.
+
+With a prefix argument ARG, jump backward ARG many source blocks."
+  (interactive "p")
+  (jupyter-org-next-busy-src-block arg 'backward))
 
 ;;;###autoload
 (defun jupyter-org-inspect-src-block ()
@@ -379,14 +460,17 @@ Defaults to `jupyter-org-jump-to-block-context-lines'."
     (let* ((header-start (nth 5 src-info))
            (header-end (save-excursion (goto-char header-start)
                                        (line-end-position))))
-      (setf (buffer-substring header-start header-end)
-            (read-string "Header: "
-                         (buffer-substring header-start header-end))))))
+      (let ((header (read-string "Header: "
+                                 (buffer-substring header-start header-end))))
+        (save-excursion
+          (delete-region header-start header-end)
+          (goto-char header-start)
+          (insert header))))))
 
 (defun jupyter-org-src-block-bounds ()
   "Return the region containing the current source block.
 If the source block has results, include the results in the
-returned region. The region is returned as (BEGIN . END)"
+returned region.  The region is returned as (BEGIN . END)"
   (unless (org-in-src-block-p)
     (error "Not in a source block"))
   (let* ((src (org-element-context))
@@ -467,7 +551,7 @@ If BELOW is non-nil, add the cloned block below."
       (save-excursion
         (goto-char next-src-block-end)
         (when (looking-at-p "[[:space:]]*$")
-          (set-marker next-src-block-end (+ (point-at-eol) 1))))
+          (set-marker next-src-block-end (+ (line-end-position) 1))))
       (delete-region next-src-block-beg next-src-block-end)
       (set-marker next-src-block-beg nil)
       (set-marker next-src-block-end nil)))
@@ -494,7 +578,7 @@ If BELOW is non-nil, move the block down, otherwise move it up."
       ;; if there is an empty line remaining, take that line as part of the
       ;; ... block
       (when (and (looking-at-p "[[:space:]]*$") (/= (point) (point-max)))
-        (delete-region (point-at-bol) (+ (point-at-eol) 1))
+        (delete-region (line-beginning-position) (+ (line-end-position) 1))
         (setq block (concat block "\n")))
       (if below
           ;; if below, move past the next source block or its result
@@ -523,10 +607,20 @@ If BELOW is non-nil, move the block down, otherwise move it up."
 (defun jupyter-org-clear-all-results ()
   "Clear all results in the buffer."
   (interactive)
-  (save-excursion
-    (goto-char (point-min))
-    (while (org-babel-next-src-block)
-      (org-babel-remove-result))))
+  (org-save-outline-visibility nil
+    (save-excursion
+      (goto-char (point-min))
+      (while (org-babel-next-src-block)
+        (org-babel-remove-result)))))
+
+;;;###autoload
+(defun jupyter-org-interrupt-kernel ()
+  "Interrupt the kernel."
+  (interactive)
+  (unless (org-in-src-block-p)
+    (error "Not in a source block"))
+  (jupyter-org-with-src-block-client
+   (jupyter-repl-interrupt-kernel)))
 
 (defun jupyter-org-hydra/body ()
   "Hack to bind a hydra only if the hydra package exists."
@@ -537,18 +631,18 @@ If BELOW is non-nil, move the block down, otherwise move it up."
   (fmakunbound 'jupyter-org-hydra/body)
   (eval `(defhydra jupyter-org-hydra (:color blue :hint nil)
            "
-          Execute                     Navigate       Edit             Misc
-------------------------------------------------------------------------------
-    _<return>_: current               _p_: previous  _C-p_: move up     _/_: inspect
-  _C-<return>_: current to next       _n_: next      _C-n_: move down   _l_: clear result
-  _M-<return>_: to point              _g_: visible     _x_: kill        _L_: clear all
-_C-M-<return>_: subtree to point      _G_: any         _c_: copy
-  _S-<return>_: Restart/block     _<tab>_: (un)fold    _o_: clone
-_S-C-<return>_: Restart/to point      ^ ^              _m_: merge
-_S-M-<return>_: Restart/buffer        ^ ^              _s_: split
-           _r_: Goto repl             ^ ^              _+_: insert above
-           ^ ^                        ^ ^              _=_: insert below
-           ^ ^                        ^ ^              _h_: header"
+          Execute                     Navigate            Edit              Misc
+-------------------------------------------------------------------------------------------
+    _<return>_: current               _p_: previous       _C-p_: move up    _/_: inspect
+  _C-<return>_: current to next       _P_: previous busy  _C-n_: move down  _l_: clear result
+  _M-<return>_: to point              _n_: next           _x_: kill         _L_: clear all
+_C-M-<return>_: subtree to point      _N_: next busy      _c_: copy         _i_: interrupt
+  _S-<return>_: Restart/block         _g_: visible        _o_: clone      _C-s_: scratch buffer
+_S-C-<return>_: Restart/to point      _G_: any            _m_: merge
+_S-M-<return>_: Restart/buffer    _<tab>_: (un)fold       _s_: split
+           _r_: Goto repl             ^ ^                 _+_: insert above
+           ^ ^                        ^ ^                 _=_: insert below
+           ^ ^                        ^ ^                 _h_: header"
            ("<return>" org-ctrl-c-ctrl-c :color red)
            ("C-<return>" jupyter-org-execute-and-next-block :color red)
            ("M-<return>" jupyter-org-execute-to-point)
@@ -559,7 +653,9 @@ _S-M-<return>_: Restart/buffer        ^ ^              _s_: split
            ("r" org-babel-switch-to-session)
 
            ("p" org-babel-previous-src-block :color red)
+           ("P" jupyter-org-previous-busy-src-block :color red)
            ("n" org-babel-next-src-block :color red)
+           ("N" jupyter-org-next-busy-src-block :color red)
            ("g" jupyter-org-jump-to-visible-block)
            ("G" jupyter-org-jump-to-block)
            ("<tab>" org-cycle :color red)
@@ -577,10 +673,13 @@ _S-M-<return>_: Restart/buffer        ^ ^              _s_: split
            ("L" jupyter-org-clear-all-results)
            ("h" jupyter-org-edit-header)
 
-           ("/" jupyter-org-inspect-src-block)))
+           ("/" jupyter-org-inspect-src-block)
+           ("i" jupyter-org-interrupt-kernel)
+           ("C-s" org-babel-jupyter-scratch-buffer)))
   (call-interactively #'jupyter-org-hydra/body))
 
 (define-key jupyter-org-interaction-mode-map (kbd "C-c h") #'jupyter-org-hydra/body)
 
 (provide 'jupyter-org-extensions)
+
 ;;; jupyter-org-extensions.el ends here

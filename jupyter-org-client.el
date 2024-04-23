@@ -1,14 +1,13 @@
 ;;; jupyter-org-client.el --- Org integration -*- lexical-binding: t -*-
 
-;; Copyright (C) 2018 Nathaniel Nicandro
+;; Copyright (C) 2018-2024 Nathaniel Nicandro
 
 ;; Author: Nathaniel Nicandro <nathanielnicandro@gmail.com>
 ;; Created: 02 Jun 2018
-;; Version: 0.8.0
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
-;; published by the Free Software Foundation; either version 2, or (at
+;; published by the Free Software Foundation; either version 3, or (at
 ;; your option) any later version.
 
 ;; This program is distributed in the hope that it will be useful, but
@@ -34,10 +33,17 @@
 
 (declare-function org-babel-python-table-or-string "ob-python" (results))
 (declare-function org-babel-jupyter-initiate-session "ob-jupyter" (&optional session params))
+(declare-function org-babel-jupyter-src-block-session "ob-jupyter" ())
+(declare-function org-babel-jupyter-session-initiated-p "ob-jupyter" (params))
+(declare-function org-babel-jupyter-language-p "ob-jupyter" (lang))
 (declare-function org-element-context "org-element" (&optional element))
+(declare-function org-element-create "org-element" (type &optional props &rest children))
 (declare-function org-element-type "org-element" (element))
 (declare-function org-element-normalize-string "org-element" (s))
 (declare-function org-element-at-point "org-element" ())
+(declare-function org-element-parse-buffer "org-element" (&optional granularity visible-only))
+(declare-function org-element-map "org-element"
+                  (data types fun &optional info first-match no-recursion with-affiliated))
 (declare-function org-drag-element-forward "org-element" ())
 (declare-function org-element-property "org-element" (property element))
 (declare-function org-element-set-contents "org-element" (element &rest contents))
@@ -52,6 +58,19 @@
 (declare-function org-at-table-p "org" ())
 (declare-function org-inside-LaTeX-fragment-p "org" ())
 (declare-function org-toggle-latex-fragment "org" (&optional arg))
+
+(defcustom jupyter-org-auto-connect t
+  "Automatically establish a connection to a src-block session.
+If this variable is non-nil, then a connection to a src-block
+session is automatically established under certain conditions,
+e.g. during auto-completion.  Otherwise there would have to be an
+available connection already if this variable is nil for features
+like auto-completion to work.
+
+When this variable is nil, you can establish a connection to a
+session by, for example, executing a src-block."
+  :group 'ob-jupyter
+  :type 'boolean)
 
 (defcustom jupyter-org-resource-directory "./.ob-jupyter/"
   "Directory used to store automatically generated image files.
@@ -68,9 +87,21 @@ automatically be shown if this is non-nil."
 
 (defcustom jupyter-org-pandoc-convertable
   '("html" "markdown" "latex")
-  "Export blocks to convert to org-mode when ':pandoc t' header is set."
+  "Export blocks to convert to `org-mode' when ':pandoc t' header is set."
   :group 'ob-jupyter
-  :type 'string)
+  :type '(repeat string))
+
+(defcustom jupyter-org-adjust-image-size t
+  "Try to best fit image output in the result block.
+
+If non-nil, and `org-image-actual-width' is set to a list, the
+image will not be stretched if its width is smaller than \(car
+`org-image-actual-width'\).  This is done by inserting an
+#+ATTR_ORG keyword above the file path.
+
+See also the docstring of `org-image-actual-width' for more details."
+  :group 'ob-jupyter
+  :type 'boolean)
 
 (defconst jupyter-org-mime-types '(:text/org
                                    ;; Prioritize images over html
@@ -80,10 +111,7 @@ automatically be shown if this is non-nil."
   "MIME types handled by Jupyter Org.")
 
 (defclass jupyter-org-client (jupyter-repl-client)
-  ((block-params
-    :initform nil
-    :documentation "The parameters of the most recently executed
-source code block. Set by `org-babel-execute:jupyter'.")))
+  ())
 
 (cl-defstruct (jupyter-org-request
                (:include jupyter-request)
@@ -97,56 +125,98 @@ source code block. Set by `org-babel-execute:jupyter'.")))
   id-cleared-p
   inline-block-p
   marker
-  async)
+  async-p)
+
+(defun jupyter-org-execute-async-p (params)
+  "Return non-nil if an execution should be asynchronous based on PARAMS.
+
+PARAMS are the source block arguments as returned by,
+e.g. `org-babel-get-src-block-info'."
+  (and (member (alist-get :async params) '("yes" nil))
+       ;; When computing results but not doing anything with them, it
+       ;; typically signifies that a reference to this source block is
+       ;; being resolved (`org-babel-ref-resolve').
+       ;;
+       ;; TODO Although if a source block had
+       ;;
+       ;;     :results none :async yes
+       ;;
+       ;; as header arguments it would still make sense to execute it
+       ;; asynchronously when executing it manually instead of through
+       ;; a reference so there needs to be a way to determine if an
+       ;; execution of a source block is occurring due to resolution
+       ;; of a reference.
+       (not (member "none" (alist-get :result-params params)))))
 
 ;;; `jupyter-kernel-client' interface
 
 ;;;; `jupyter-request' interface
 
-(cl-defmethod jupyter-generate-request ((client jupyter-org-client) _msg
-                                        &context (major-mode (eql org-mode)))
+(defvar org-babel-jupyter-current-src-block-params)
+
+(cl-defmethod jupyter-generate-request ((_client jupyter-org-client) &rest slots)
   "Return a `jupyter-org-request' for the current source code block."
-  (if org-babel-current-src-block-location
+  (if (and org-babel-current-src-block-location
+           org-babel-jupyter-current-src-block-params
+           (provided-mode-derived-p
+            (buffer-local-value
+             ;; Handle indirect buffers used by packages like polymode, see #171.
+             'major-mode (or (buffer-base-buffer) (current-buffer)))
+            'org-mode))
       ;; Only use a `jupyter-org-request' when executing code blocks, setting
       ;; the `major-mode' context isn't enough, consider when a client is
       ;; started due to sending a completion request.
-      (let* ((block-params (oref client block-params))
-             (result-params (alist-get :result-params block-params)))
-        (jupyter-org-request
-         :marker (copy-marker org-babel-current-src-block-location)
-         :inline-block-p (save-excursion
-                           (goto-char org-babel-current-src-block-location)
-                           (and (memq (org-element-type (org-element-context))
-                                      '(inline-babel-call inline-src-block))
-                                t))
-         :result-type (alist-get :result-type block-params)
-         :file (alist-get :file block-params)
-         :block-params block-params
-         :async (equal (alist-get :async block-params) "yes")
-         :silent-p (car (or (member "none" result-params)
-                            (member "silent" result-params)))))
+      (save-excursion
+        (goto-char org-babel-current-src-block-location)
+        (let* ((context (org-element-context))
+               (block-params org-babel-jupyter-current-src-block-params)
+               (result-params (alist-get :result-params block-params))
+               (req
+                (apply #'jupyter-org-request
+                       (append
+                        (list
+                         :marker (copy-marker org-babel-current-src-block-location)
+                         :inline-block-p (and (memq (org-element-type context)
+                                                    '(inline-babel-call inline-src-block))
+                                              t)
+                         :result-type (alist-get :result-type block-params)
+                         :file (alist-get :file block-params)
+                         :block-params block-params
+                         :async-p (jupyter-org-execute-async-p block-params)
+                         :silent-p (car (or (member "none" result-params)
+                                            (member "silent" result-params))))
+                        slots))))
+          (put-text-property
+           org-babel-current-src-block-location
+           (1+ org-babel-current-src-block-location)
+           'jupyter-request req)
+          req))
     (cl-call-next-method)))
 
-(cl-defmethod jupyter-drop-request ((_client jupyter-org-client)
-                                    (req jupyter-org-request))
-  (when (markerp (jupyter-org-request-marker req))
-    (set-marker (jupyter-org-request-marker req) nil)))
+(defun jupyter-org-request-at-point ()
+  "Return the `jupyter-org-request' associated with `point' or nil."
+  (when-let* ((context (org-element-context))
+              (babel-p (memq (org-element-type context)
+                             '(src-block babel-call
+                               inline-babel-call inline-src-block)))
+              (pos (jupyter-org-element-begin-after-affiliated context))
+              (req (get-text-property pos 'jupyter-request)))
+    (and (not (jupyter-request-idle-p req))
+         req)))
 
 ;;;; Stream
 
-(cl-defmethod jupyter-handle-stream ((_client jupyter-org-client)
-                                     (req jupyter-org-request)
-                                     _name
-                                     text)
-  (if (jupyter-org-request-inline-block-p req)
-      (jupyter-with-display-buffer "org-results" req
-        (insert (ansi-color-apply text))
-        (pop-to-buffer (current-buffer)))
-    (jupyter-org--add-result
-     req (with-temp-buffer
-           (jupyter-with-control-code-handling
-            (insert text))
-           (buffer-string)))))
+(cl-defmethod jupyter-handle-stream ((_client jupyter-org-client) (req jupyter-org-request) msg)
+  (jupyter-with-message-content msg (text)
+    (if (jupyter-org-request-inline-block-p req)
+        (jupyter-with-display-buffer "org-results" req
+          (jupyter-with-insertion-bounds
+              beg end (insert text)
+            (when ansi-color-context-region
+              (move-marker (cadr ansi-color-context-region) (point)))
+            (ansi-color-apply-on-region beg end))
+          (pop-to-buffer (current-buffer)))
+      (jupyter-org--add-result req text))))
 
 ;;;; Errors
 
@@ -160,7 +230,7 @@ source code block. Set by `org-babel-execute:jupyter'.")))
 (defun jupyter-org-goto-error ()
   "Go to the error location specified by the jupyter-error-loc text property.
 If `point' has a non-nil jupyter-error-loc property, jump to that
-line in the previous source block. See
+line in the previous source block.  See
 `jupyter-org-error-location'."
   (interactive)
   (when-let* ((loc (get-text-property (point) 'jupyter-error-loc)))
@@ -176,7 +246,7 @@ line in the previous source block. See
   "Return the line number corresponding to an error from a traceback.
 This method is called with `point' at `point-min' in a buffer
 containing the traceback of the last error that occurred due to
-execution of a source block. It should return the line number
+execution of a source block.  It should return the line number
 relative to the source block that caused the error or nil if a
 line number could not be found."
   (ignore))
@@ -212,86 +282,68 @@ to."
 
 (defvar org-font-lock-hook)
 
-(cl-defmethod jupyter-handle-error ((_client jupyter-org-client)
-                                    (req jupyter-org-request)
-                                    _ename
-                                    _evalue
-                                    traceback)
-  (setq traceback (org-element-normalize-string
-                   (mapconcat #'identity traceback "\n")))
-  (cond
-   ((or (jupyter-org-request-inline-block-p req)
-        (jupyter-org-request-silent-p req))
-    ;; Remove old inline results when an error happens since, if this was not
-    ;; done, it would look like the code which caused the error produced the
-    ;; old result.
-    (when (jupyter-org-request-inline-block-p req)
-      (org-with-point-at (jupyter-org-request-marker req)
-        (org-babel-remove-inline-result)))
-    (jupyter-with-display-buffer "traceback" 'reset
-      (jupyter-insert-ansi-coded-text traceback)
-      (goto-char (point-min))
-      (when (jupyter-org-request-silent-p req)
-        (insert (jupyter-org--goto-error-string req) "\n\n"))
-      (pop-to-buffer (current-buffer))))
-   (t
-    ;; The keymap property in the string returned by
-    ;; `jupyter-org--goto-error-string' gets removed by font-lock so ensure it
-    ;; is re-added.
-    (unless (memq 'jupyter-org-add-error-keymap org-font-lock-hook)
-      (add-hook 'org-font-lock-hook 'jupyter-org-add-error-keymap nil t))
-    (setq traceback (ansi-color-apply traceback))
-    (jupyter-org--add-result
-     req (jupyter-org-comment
-          (with-temp-buffer
-            (insert traceback)
-            (jupyter-org--goto-error-string req))))
-    (jupyter-org--add-result req traceback))))
+(cl-defmethod jupyter-handle-error ((_client jupyter-org-client) (req jupyter-org-request) msg)
+  (jupyter-with-message-content msg (traceback)
+    (setq traceback (org-element-normalize-string
+                     (mapconcat #'identity traceback "\n")))
+    (pcase-let (((cl-struct jupyter-org-request
+                            marker inline-block-p silent-p)
+                 req))
+      (cond
+       ((or inline-block-p silent-p)
+        ;; Remove old inline results when an error happens since, if this was not
+        ;; done, it would look like the code which caused the error produced the
+        ;; old result.
+        (when inline-block-p
+          (org-with-point-at marker
+            (org-babel-remove-inline-result)))
+        (jupyter-with-display-buffer "traceback" 'reset
+          (jupyter-insert-ansi-coded-text traceback)
+          (goto-char (point-min))
+          (when silent-p
+            (insert (jupyter-org--goto-error-string req) "\n\n"))
+          (pop-to-buffer (current-buffer))))
+       (t
+        ;; The keymap property in the string returned by
+        ;; `jupyter-org--goto-error-string' gets removed by font-lock so ensure it
+        ;; is re-added.
+        (unless (memq 'jupyter-org-add-error-keymap org-font-lock-hook)
+          (add-hook 'org-font-lock-hook 'jupyter-org-add-error-keymap nil t))
+        (jupyter-org--add-result
+         req (jupyter-org-comment
+              (with-temp-buffer
+                (insert traceback)
+                (jupyter-org--goto-error-string req))))
+        (jupyter-org--add-result req traceback))))))
 
 ;;;; Execute result
 
-(cl-defmethod jupyter-handle-execute-result ((_client jupyter-org-client)
-                                             (req jupyter-org-request)
-                                             _execution-count
-                                             data
-                                             metadata)
+(cl-defmethod jupyter-handle-execute-result ((_client jupyter-org-client) (req jupyter-org-request) msg)
   (unless (eq (jupyter-org-request-result-type req) 'output)
-    (cond
-     ((jupyter-org-request-inline-block-p req)
-      ;; For inline results, only text/plain results are allowed
-      ;;
-      ;; TODO: Possibly file links are allowed as well. See
-      ;; `org-babel-insert-result'
-      (setq data (plist-get data :text/plain))
-      (if (jupyter-org-request-async req)
-          (org-with-point-at (jupyter-org-request-marker req)
-            (org-babel-insert-result data))
-        ;; The results are returned in `org-babel-execute:jupyter' in the
-        ;; synchronous case
-        (jupyter-org--add-result req data)))
-     (t
-      (jupyter-org--add-result req (jupyter-org-result req data metadata))))))
+    (jupyter-with-message-content msg (data metadata)
+      (when (jupyter-org-request-inline-block-p req)
+        ;; For inline results, only text/plain results are allowed at the moment.
+        ;;
+        ;; TODO: Handle all of the different macro types for inline results, see
+        ;; `org-babel-insert-result'.
+        (setq data `(:text/plain ,(plist-get data :text/plain))))
+      (jupyter-org--add-result req data metadata))))
 
 ;;;; Display data
 
-(cl-defmethod jupyter-handle-display-data ((_client jupyter-org-client)
-                                           (req jupyter-org-request)
-                                           data
-                                           metadata
-                                           ;; TODO: Add request objects as text
-                                           ;; properties of source code blocks
-                                           ;; to implement display IDs. Or how
-                                           ;; can #+NAME be used as a display
-                                           ;; ID?
-                                           _transient)
+(cl-defmethod jupyter-handle-display-data ((_client jupyter-org-client) (req jupyter-org-request) msg)
+  ;; TODO: Add request objects as text properties of source code blocks to
+  ;; implement display IDs.  Or how can #+NAME be used as a display ID?
+  ;;
   ;; Only the data of the execute-result message is inserted into the buffer
   ;; for inline code blocks.
-  (if (jupyter-org-request-inline-block-p req)
-      (jupyter-with-display-buffer "org-results" req
-        (jupyter-insert data metadata)
-        (pop-to-buffer (current-buffer))
-        (set-window-point (get-buffer-window (current-buffer)) (point-min)))
-    (jupyter-org--add-result req (jupyter-org-result req data metadata))))
+  (jupyter-with-message-content msg (data metadata)
+    (if (jupyter-org-request-inline-block-p req)
+        (jupyter-with-display-buffer "org-results" req
+          (jupyter-insert data metadata)
+          (pop-to-buffer (current-buffer))
+          (set-window-point (get-buffer-window (current-buffer)) (point-min)))
+      (jupyter-org--add-result req data metadata))))
 
 ;;;; Execute reply
 
@@ -312,21 +364,18 @@ to."
       (forward-line)
       (insert (org-element-normalize-string (plist-get pl :text))))))
 
-(cl-defmethod jupyter-handle-execute-reply ((_client jupyter-org-client)
-                                            (req jupyter-org-request)
-                                            status
-                                            _execution-count
-                                            _user-expressions
-                                            payload)
-  (when payload
-    (org-with-point-at (jupyter-org-request-marker req)
-      (jupyter-handle-payload payload)))
-  (if (equal status "ok")
-      (message "Code block evaluation complete.")
-    (message "An error occurred when evaluating code block."))
-  (when (jupyter-org-request-async req)
-    (jupyter-org--clear-request-id req)
-    (run-hooks 'org-babel-after-execute-hook)))
+(cl-defmethod jupyter-handle-execute-reply ((_client jupyter-org-client) (req jupyter-org-request) msg)
+  (jupyter-with-message-content msg (status payload)
+    (when payload
+      (org-with-point-at (jupyter-org-request-marker req)
+        (jupyter-handle-payload payload)))
+    (if (equal status "ok")
+        (message "Code block evaluation complete.")
+      (message "An error occurred when evaluating code block."))
+    (when (jupyter-org-request-async-p req)
+      (jupyter-org--clear-request-id req)
+      (org-with-point-at (jupyter-org-request-marker req)
+        (run-hooks 'org-babel-after-execute-hook)))))
 
 ;;; Completion in code blocks
 
@@ -357,8 +406,8 @@ most recent completion request.")
   (unless (jupyter-org--same-src-block-p)
     (let* ((el (org-element-at-point))
            (lang (org-element-property :language el)))
-      (when (string-prefix-p "jupyter-" lang)
-        (let* ((info (org-babel-get-src-block-info el))
+      (when (org-babel-jupyter-language-p lang)
+        (let* ((info (org-babel-get-src-block-info t el))
                (params (nth 2 info))
                (beg (save-excursion
                       (goto-char (org-element-property :post-affiliated el))
@@ -382,7 +431,7 @@ Return the result of BODY when it is evaluated, otherwise nil is
 returned."
   (declare (debug (body)))
   `(if (not (org-in-src-block-p 'inside))
-       ;; Invalidate cache when going outside of a source block. This way if
+       ;; Invalidate cache when going outside of a source block.  This way if
        ;; the language of the block changes we don't end up using the cache
        ;; since it is only used for Jupyter blocks.
        (when jupyter-org--src-block-cache
@@ -395,26 +444,32 @@ returned."
 
 (defmacro jupyter-org-with-src-block-client (&rest body)
   "Evaluate BODY with `jupyter-current-client' set to the session's client.
-A client is initialized if necessary.
+A client is initialized if needed when `jupyter-org-auto-connect'
+is non-nil.  When that variable is nil and no client is present
+for the source block, don't evaluate BODY and return nil.
 
 If `point' is not inside the code of a Jupyter source block, BODY
-is not evaluated and nil is returned. Return the result of BODY
+is not evaluated and nil is returned.  Return the result of BODY
 when it is evaluated.
 
 In addition to evaluating BODY with an active Jupyter client set,
-the `syntax-table' will be set to that of the REPL buffers."
+the `syntax-table' will be set to that of the REPL buffer's."
   (declare (debug (body)))
   (let ((params (make-symbol "params"))
-        (syntax (make-symbol "syntax")))
+        (syntax (make-symbol "syntax"))
+        (buffer (make-symbol "buffer")))
     `(jupyter-org-when-in-src-block
-      (let* ((,params (car jupyter-org--src-block-cache))
-             (jupyter-current-client
-              (buffer-local-value 'jupyter-current-client
-                                  (org-babel-jupyter-initiate-session
-                                   (alist-get :session ,params) ,params)))
-             (,syntax (jupyter-kernel-language-syntax-table jupyter-current-client)))
-        (with-syntax-table ,syntax
-          ,@body)))))
+      (let ((,params (car jupyter-org--src-block-cache)))
+        (when (or jupyter-org-auto-connect
+                  (org-babel-jupyter-session-initiated-p ,params))
+          (let* ((,buffer (org-babel-jupyter-initiate-session
+                           (alist-get :session ,params) ,params))
+                 (jupyter-current-client
+                  (buffer-local-value 'jupyter-current-client ,buffer))
+                 (,syntax (jupyter-kernel-language-syntax-table
+                           jupyter-current-client)))
+            (with-syntax-table ,syntax
+              ,@body)))))))
 
 (cl-defmethod jupyter-code-context ((_type (eql inspect))
                                     &context (major-mode org-mode))
@@ -423,7 +478,7 @@ the `syntax-table' will be set to that of the REPL buffers."
 
 (cl-defmethod jupyter-code-context ((_type (eql completion))
                                     &context (major-mode org-mode))
-  ;; Always called from within a valid code block. See
+  ;; Always called from within a valid code block.  See
   ;; `jupyter-org-completion-at-point'.
   (list (buffer-substring-no-properties
          (jupyter-org--src-block-beg)
@@ -437,7 +492,7 @@ the `syntax-table' will be set to that of the REPL buffers."
 ;;; Inspection
 
 (cl-defmethod jupyter-inspect (&context (major-mode org-mode)
-                                        &rest _)
+                                        &rest _ignore)
   (jupyter-org-with-src-block-client
    (cl-call-next-method)))
 
@@ -470,6 +525,8 @@ any Jupyter code block, [jupyter]."
   (jupyter-org-with-src-block-client
    (call-interactively def)))
 
+(defvar jupyter-org--defining-key-p nil)
+
 (defun jupyter-org-define-key (key def &optional lang)
   "Bind KEY to DEF, but only when inside a Jupyter code block.
 
@@ -478,9 +535,9 @@ the `jupyter-current-client' of the session associated with the
 code block, see `jupyter-org-with-src-block-client'.
 
 If LANG is non-nil, it is a language symbol such as python or
-julia. Only bind KEY to DEF whenever the underlying kernel
-language is LANG. If LANG is nil, then KEY is bound to DEF
-regardless of kernel language. Note, the same key can be bound
+julia.  Only bind KEY to DEF whenever the underlying kernel
+language is LANG.  If LANG is nil, then KEY is bound to DEF
+regardless of kernel language.  Note, the same key can be bound
 for different kernel languages.
 
 All of the keys are bound in `jupyter-org-interaction-mode-map'
@@ -502,15 +559,19 @@ and they only take effect when the variable
             (defalias (make-symbol (symbol-name def))
               cmd (documentation def))
           cmd))))
-  ;; NOTE: This will set the key multiple times if the same binding is used
-  ;; for different kernel languages even though it only needs to be defined
-  ;; once. `lookup-key' won't work for checking if it is already defined since
-  ;; the filter function of the menu-item returns nil if a client isn't
-  ;; defined.
-  (define-key jupyter-org-interaction-mode-map key
-    `(menu-item
-      "" nil :filter
-      ,(apply-partially #'jupyter-org--define-key-filter key))))
+  (let ((jupyter-org--defining-key-p t))
+    (unless (functionp (lookup-key jupyter-org-interaction-mode-map key))
+      (define-key jupyter-org-interaction-mode-map key
+        (list 'menu-item "" nil :filter
+              (lambda (&rest _)
+                (if jupyter-org--defining-key-p
+                    ;; Stub definition so that `lookup-key' returns a non-nil
+                    ;; value since the normal filter only returns a definition
+                    ;; when inside a source block.  We only need to make the
+                    ;; definition for KEY once and not on every re-definition
+                    ;; of KEY for a particular language.
+                    #'undefined
+                  (jupyter-org--define-key-filter key))))))))
 
 (jupyter-org-define-key (kbd "C-x C-e") #'jupyter-eval-line-or-region)
 (jupyter-org-define-key (kbd "C-M-x") #'jupyter-eval-defun)
@@ -522,14 +583,14 @@ and they only take effect when the variable
 
 ;; NOTE: We cache the properties here since this is called during the font-lock
 ;; process (and maybe shouldn't be?) which means that it can be called many
-;; times on the same region. We don't want to re-compute the faces on each
+;; times on the same region.  We don't want to re-compute the faces on each
 ;; call.
 (defun jupyter-org--ansi-color-apply-on-region (begin end)
   "Handle ANSI escape codes between (BEGIN . END) and cache the results.
 If (BEGIN . END) is not marked with a jupyter-ansi text property,
 apply `jupyter-ansi-color-apply-on-region' on the region and mark
-it with a non-nil jupyter-ansi property. Otherwise, prepend any
-non-nil font-lock-face properties in the region to the face
+it with a non-nil jupyter-ansi property.  Otherwise, prepend any
+non-nil jupyter-face properties in the region to the face
 property."
   ;; Don't add these changes to the undo list, gives a slight speed up.
   (let ((buffer-undo-list t)
@@ -537,28 +598,29 @@ property."
         next begin1 end1)
     (while (/= begin end)
       (setq next (next-single-property-change begin 'jupyter-ansi nil end))
-      (if (get-text-property begin 'jupyter-ansi)
-          (progn
-            (setq begin1 begin
-                  end1 next
-                  begin next)
-            (while (/= begin1 end1)
-              (setq next (next-single-property-change
-                          begin1 'font-lock-face nil end1))
-              (when (get-text-property begin1 'font-lock-face)
-                (font-lock-prepend-text-property
-                 begin1 next 'face (get-text-property begin1 'font-lock-face)))
-              (setq begin1 next)))
+      (cond
+       ((get-text-property begin 'jupyter-ansi)
+        (setq begin1 begin
+              end1 next
+              begin next)
+        (while (/= begin1 end1)
+          (setq next (next-single-property-change
+                      begin1 'jupyter-face nil end1))
+          (when (get-text-property begin1 'jupyter-face)
+            (font-lock-prepend-text-property
+             begin1 next 'face (get-text-property begin1 'jupyter-face)))
+          (setq begin1 next)))
+       (t
         (put-text-property begin next 'jupyter-ansi t)
-        (jupyter-ansi-color-apply-on-region begin next)
-        (setq begin next)))))
+        (jupyter-ansi-color-apply-on-region begin next 'jupyter-face)
+        (setq begin next))))))
 
 ;; Adapted from `org-fontify-meta-lines-and-blocks-1'
 (defun jupyter-org-font-lock-ansi-escapes (limit)
   (let ((case-fold-search t))
     (when (re-search-forward
-           "^\\([ \t]*#\\+begin_example[ \t]*\\|: .*\\)$" limit t)
-      (let ((beg (match-beginning 0))
+           "^[ \t]*\\(#\\+begin_example[ \t]*\\|: .*\\)$" limit t)
+      (let ((beg (match-beginning 1))
             (beg1 (line-beginning-position 2))
             end)
         (cond
@@ -571,7 +633,7 @@ property."
             (jupyter-org--ansi-color-apply-on-region beg1 end)))
          ;; fixed width
          (t
-          (setq end (or (and (re-search-forward "^[^:]" nil t)
+          (setq end (or (and (re-search-forward "^[ \t]*[^ \t:]" nil t)
                              (1- (match-beginning 0)))
                         (point-max)))
           (jupyter-org--ansi-color-apply-on-region beg end)))))))
@@ -584,7 +646,7 @@ property."
   "Minor mode for interacting with a Jupyter REPL from an `org-mode' buffer.
 When this minor mode is enabled, some of the keybindings
 available in `jupyter-repl-interaction-mode' are also available
-when `point' is inside a Jupyter code block. Completion is also
+when `point' is inside a Jupyter code block.  Completion is also
 enabled when `point' is inside a code block.
 
 In addition, ANSI escape sequences in example blocks or
@@ -612,19 +674,19 @@ C-x C-e         `jupyter-eval-line-or-region'"
                 (copy-tree char-property-alias-alist))
     (cl-callf append (alist-get 'invisible char-property-alias-alist)
       '(jupyter-invisible))
-    (unless (cl-find-if (lambda (x) (eq (car x) 'jupyter-org-font-lock-ansi-escapes))
-                        org-font-lock-keywords)
-      (setq org-font-lock-keywords
-            (append org-font-lock-keywords
-                    '((jupyter-org-font-lock-ansi-escapes))))))
+    (unless (cl-find-if
+             (lambda (x) (eq (car x) 'jupyter-org-font-lock-ansi-escapes))
+             org-font-lock-keywords)
+      (cl-callf append org-font-lock-keywords
+        '((jupyter-org-font-lock-ansi-escapes)))))
    (t
     (remove-hook 'completion-at-point-functions 'jupyter-org-completion-at-point t)
     (remove-hook 'after-revert-hook 'jupyter-org-interaction-mode t)
     (cl-callf2 delq 'jupyter-invisible
                (alist-get 'invisible char-property-alias-alist))
-    (setq org-font-lock-keywords
-          (cl-remove-if (lambda (x) (eq (car x) 'jupyter-org-font-lock-ansi-escapes))
-                        org-font-lock-keywords)))))
+    (cl-callf2 cl-remove-if
+        (lambda (x) (eq (car x) 'jupyter-org-font-lock-ansi-escapes))
+        org-font-lock-keywords))))
 
 (add-hook 'org-mode-hook 'jupyter-org-interaction-mode)
 
@@ -644,41 +706,53 @@ C-x C-e         `jupyter-eval-line-or-region'"
 (defun jupyter-org-raw-string (str)
   "Return STR, ensuring that it is flagged as already being `org' syntax.
 Adds a non-nil jupyter-org text property on the first character
-of STR. If a string returned by `jupyter-org-result' has a
+of STR.  If a string returned by `jupyter-org-result' has a
 non-nil jupyter-org property on the first character, it is
 inserted without modification as the result of a code block."
   (prog1 str
     (put-text-property 0 1 'jupyter-org t str)))
 
+(defun jupyter-org-table-string (str)
+  "Return STR, ensuring that it is flagged as containing an `org' table.
+We need a way to distinguish a table string that is easily
+removed from the code block vs a regular string that will need to
+be wrapped in a drawer.  Used in `jupyter-org-babel-result-p'."
+  (prog1 (jupyter-org-raw-string str)
+    (put-text-property 0 1 'org-table t str)))
+
 (defun jupyter-org-comment (value)
   "Return a comment `org-element' with VALUE."
-  (list 'comment (list :value value)))
+  (org-element-create 'comment (list :value value)))
 
 (defun jupyter-org-export-block-or-pandoc (type value params)
-  "Returns VALUE, either converted with pandoc or in an export block.
+  "Return VALUE, either converted with pandoc or in an export block.
 If PARAMS has non-nil value for key ':pandoc' and TYPE is in
 `jupyter-org-pandoc-convertable', convert the result with pandoc.
 Otherwise, wrap it in an export block."
   (if (and (alist-get :pandoc params)
            (member type jupyter-org-pandoc-convertable))
-      (jupyter-org-raw-string (jupyter-pandoc-convert type "org" value))
+      (list 'pandoc
+            (list :text "Converting..."
+                  :type type
+                  :value value))
     (jupyter-org-export-block type value)))
 
 (defun jupyter-org-export-block (type value)
   "Return an export-block `org-element'.
 The block will export TYPE and the contents of the block will be
 VALUE."
-  (list 'export-block (list :type type
+  (org-element-create 'export-block
+                      (list :type type
                             :value (org-element-normalize-string value))))
 
 (defun jupyter-org-file-link (path)
   "Return a file link `org-element' that points to PATH."
-  (list 'link (list :type "file" :path path)))
+  (org-element-create 'link (list :type "file" :path path)))
 
 (defun jupyter-org-image-link (path &optional width height)
   "Return an `org-element' for an image at PATH.
 If a WIDTH or HEIGHT are provided, then return a paragraph
-element with an affiliated keyword ATTR_ORG. So that the image
+element with an affiliated keyword ATTR_ORG.  So that the image
 link will be rendered like
 
     #+ATTR_ORG :width 300 :height 300
@@ -692,9 +766,9 @@ Otherwise return a `jupyter-org-file-link' for PATH."
                     (when height
                       (concat (when width " ")
                               ":height " (number-to-string height))))))
-        (list 'paragraph (list :attr_org (list attrs))
-              (jupyter-org-file-link path)
-              "\n"))
+        (org-element-create 'paragraph (list :attr_org (list attrs))
+                            (jupyter-org-file-link path)
+                            "\n"))
     (jupyter-org-file-link path)))
 
 (defun jupyter-org-src-block (language parameters value &optional switches)
@@ -702,14 +776,16 @@ Otherwise return a `jupyter-org-file-link' for PATH."
 LANGUAGE, PARAMETERS, VALUE, and SWITCHES all have the same
 meaning as a src-block `org-element'."
   (declare (indent 2))
-  (list 'src-block (list :language language
-                         :parameters parameters
-                         :switches switches
-                         :value value)))
+  (org-element-create 'src-block
+                      (list :language language
+                            :parameters parameters
+                            :switches switches
+                            :value value)))
 
 (defun jupyter-org-example-block (value)
   "Return an example-block `org-element' with VALUE."
-  (list 'example-block (list :value (org-element-normalize-string value))))
+  (org-element-create 'example-block
+                      (list :value (org-element-normalize-string value))))
 
 ;; From `org-babel-insert-result'
 (defun jupyter-org-tabulablep (r)
@@ -746,7 +822,7 @@ or example-block depending on
 If VALUE is another `org-element' return it unchanged.
 
 If VALUE is a list and can be represented as a table, return an
-`org-mode' table as a string. To distinguish the table from a
+`org-mode' table as a string.  To distinguish the table from a
 regular string, it has a non-nil org-table text property on its
 first character.
 
@@ -756,36 +832,23 @@ Otherwise, return VALUE formated as a fixed-width `org-element'."
     (if (cl-loop with i = 0 for c across value if (eq c ?\n) do (cl-incf i)
                  thereis (>= i org-babel-min-lines-for-block-output))
         (jupyter-org-example-block value)
-      (list 'fixed-width (list :value value))))
+      (org-element-create 'fixed-width (list :value value))))
    ((and (listp value)
          (or (memq (car value) org-element-all-objects)
              (memq (car value) org-element-all-elements)))
     value)
    ((and (listp value)
          (jupyter-org-tabulablep value))
-    (let ((table (jupyter-org-raw-string (jupyter-org-table-to-orgtbl value))))
-      (prog1 table
-        ;; We need a way to distinguish a table string that is easily removed
-        ;; from the code block vs a regular string that will need to be
-        ;; wrapped in a drawer. See `jupyter-org--append-result'.
-        (put-text-property 0 1 'org-table t table))))
+    (jupyter-org-table-string (jupyter-org-table-to-orgtbl value)))
    (t
-    (list 'fixed-width (list :value (format "%S" value))))))
-
-(defun jupyter-org-latex-fragment (value)
-  "Return a latex-fragment `org-element' consisting of VALUE."
-  (list 'latex-fragment (list :value value)))
-
-(defun jupyter-org-latex-environment (value)
-  "Return a latex-fragment `org-element' consisting of VALUE."
-  (list 'latex-environment (list :value value)))
+    (org-element-create 'fixed-width (list :value (format "%S" value))))))
 
 (defun jupyter-org-results-drawer (&rest results)
   "Return a drawer `org-element' containing RESULTS.
-RESULTS can be either strings or other `org-element's. Newlines
+RESULTS can be either strings or other `org-element's.  Newlines
 are added after every `org-element' object in RESULTS, such as
 file links, so that each result appears on a single line in the
-string representation of the drawer. The returned drawer has a
+string representation of the drawer.  The returned drawer has a
 name of \"RESULTS\"."
   (apply #'org-element-set-contents
          (list 'drawer (list :drawer-name "RESULTS"))
@@ -822,203 +885,226 @@ EXT is used as the extension."
                (concat "." ext))))
     (concat (file-name-as-directory dir) (sha1 data) ext)))
 
-(defun jupyter-org--image-result (mime params b64-encoded data &optional metadata)
+(defvar org-image-actual-width)
+
+(defun jupyter-org--add-image-ext-maybe (file &optional ext)
+  "Return a file name for FILE with EXT.
+If FILE is an image file with a specified extension, return FILE.
+If FILE is an image file without a specified extension and EXT is
+non-nil, return FILE with EXT as the extension.  Otherwise, return
+FILE."
+  (cond
+   ((null file) file)
+   ((image-type-from-file-name file) file)
+   ((not (null ext)) (concat file "." ext))
+   (t file)))
+
+(defun jupyter-org--image-result (mime content params &optional b64-encoded)
   "Return an org-element suitable for inserting an image.
-MIME is the image mimetype, PARAMS is the
-`jupyter-org-request-block-params' that caused this result to be
-returned and DATA is the image data.
+MIME is the image mimetype, CONTENT is a property list
 
-If B64-ENCODED is non-nil, DATA assumed to be a base64 encoded
-string and will be decoded before writing to file.
+    (:data D :metadata M)
 
-If PARAMS contains a :file key, it is used as the FILENAME.
-Otherwise a file name is created, see
-`jupyter-org-image-file-name'. Note, when PARAMS contains a :file
-key any existing file with the file name will be overwritten when
-writing the image data. This is not the case when a new file name
-is created.
+where D is the image data for MIME and M any metadata.  D is
+written to file and an org-element link to the file is returned.
+
+PARAMS are the `jupyter-org-request-block-params', the ones
+passed to `org-babel-execute:jupyter', of the source block that
+returned D.  If PARAMS contains a :file key, it's value is used
+as the image file name.  Otherwise a file name is created, see
+`jupyter-org-image-file-name'.  In the case that a file exists
+with the same name being used, it is overwritten.
+
+If B64-ENCODED is non-nil, the image data is assumed to be a
+base64 encoded string and will be decoded before writing to file.
 
 If METADATA contains a :width or :height key, then the returned
 org-element will have an ATTR_ORG affiliated keyword containing
-the width or height of the image."
-  (let* ((overwrite (not (null (alist-get :file params))))
-         (file (or (alist-get :file params)
+the width or height of the image.  When there is no :width or
+:height, an ATTR_ORG keyword containing the true size of the
+image may still be added, see `jupyter-org-adjust-image-size'."
+  (let* ((file-ext (cl-case mime
+                     (:image/png "png")
+                     (:image/jpeg "jpg")
+                     (:image/svg+xml "svg")))
+         (overwrite (not (null (alist-get :file params))))
+         (file (or (jupyter-org--add-image-ext-maybe (alist-get :file params) file-ext)
                    (jupyter-org-image-file-name
-                    data (cl-case mime
-                           (:image/png "png")
-                           (:image/jpeg "jpg")
-                           (:image/svg+xml "svg"))))))
+                    (plist-get content :data)
+                    file-ext))))
     (when (or overwrite (not (file-exists-p file)))
       (let ((buffer-file-coding-system
              (if b64-encoded 'binary
                buffer-file-coding-system))
             (require-final-newline nil))
         (with-temp-file file
-          (insert data)
+          (insert (plist-get content :data))
           (when b64-encoded
             (base64-decode-region (point-min) (point-max))))))
     (cl-destructuring-bind (&key width height &allow-other-keys)
-        metadata
+        (plist-get content :metadata)
+      (when (and jupyter-org-adjust-image-size (null width)
+                 (numberp (car-safe org-image-actual-width)))
+        (let ((image-width (car (image-size
+                                 (create-image (expand-file-name file))
+                                 'pixels))))
+          (when (< image-width (car org-image-actual-width))
+            (setq width image-width))))
       (jupyter-org-image-link file width height))))
 
-(cl-defgeneric jupyter-org-result (_mime _params _data &optional _metadata)
+(cl-defgeneric jupyter-org-result (_mime _content _params)
   "Return an `org-element' representing a result.
 Either a string or an `org-element' is a valid return value of
-this method. The former will be inserted as is, while the latter
+this method.  The former will be inserted as is, while the latter
 will be inserted by calling `org-element-interpret-data' first.
 
-The returned result should be a representation of a MIME type
-whose value is DATA.
+The returned result should be a representation of a MIME type's
+CONTENT. CONTENT is a property list like
 
-DATA is the data representing the MIME type and METADATA is any
-associated metadata associated with the MIME DATA.
+    '(:data DATA :metadata METADATA)
 
-As an example, if DATA only contains the mimetype
-`:text/markdown', then the returned results is
+that contains the DATA/METADATA of the mime type.  As an example,
+if MIME is `:text/markdown', then DATA should be the markdown
+string.  The returned result in this case will be
 
-    (jupyter-org-export-block \"markdown\" data)"
+    (jupyter-org-export-block \"markdown\" DATA)"
   (ignore))
 
 (defun jupyter-org--find-mime-types (req-types)
   "Return the keywords in `jupyter-org-mime-types' that match REQ-TYPES.
+REQ-TYPES is a string such as \"plain\", \"plain html\", or
+\"text/plain\".  The string \"text\" is translated to the keyword
+`:text/plain' and \"image\" to `:image/png'.
 
-If a match is not found, return nil. Try to be intelligent and
-return what the user might intend to use.
-
-REQ-TYPES can be a string such as `plain', `plain html', or
-`text/plain'. The string `text' is translated to `:text/plain'
-and `image' to `:image/png'."
-  (when req-types
+If a match is not found, return nil."
+  (when (stringp req-types)
     ;; Iterate the user-specified mimetypes looking for symbols that match a
-    ;; symbol in `jupyter-org-mime-types'. Invalid mimetypes are ignored.
-    (delete nil
-            (mapcar (lambda (req-type)
-                 (cond
-                  ((string= req-type "text") :text/plain)
-                  ((string= req-type "image") :image/png)
-                  ((stringp req-type)
-                   (let ((regexp (if (string-match "/" req-type)
-                                     req-type
-                                   (concat "/" req-type "$"))))
-                     (cl-loop for ii in jupyter-org-mime-types
-                              if (string-match regexp (symbol-name ii))
-                              return ii)))))
-               (split-string req-types)))))
+    ;; symbol in `jupyter-org-mime-types'.  Invalid mimetypes are ignored.
+    (cl-loop
+     with translations = `(("text" . :text/plain)
+                           ("image" . :image/png))
+     for req-type in (split-string req-types)
+     for match = (or (cdr (assoc req-type translations))
+                     (let ((regexp (if (string-match "/" req-type)
+                                       req-type
+                                     (concat "/" req-type "$"))))
+                       (cl-loop for mime-type in jupyter-org-mime-types
+                                if (string-match regexp (symbol-name mime-type))
+                                return mime-type)))
+     if match collect match)))
 
-(cl-defmethod jupyter-org-result ((req jupyter-org-request) plist
-                                  &optional metadata &rest _)
-  "For REQ, return the rendered DATA.
-PLIST is a property list, (:mimetype1 value1 ...), containing the
-different representations of a result returned by a kernel. Note,
-PLIST can also be a full message property list or a property list
-with a :data and :metadata key.
+(defun jupyter-org-display-mime-types (req)
+  "Return the mime types to display for REQ."
+  (or (jupyter-org--find-mime-types
+       (alist-get :display (jupyter-org-request-block-params req)))
+      jupyter-org-mime-types))
 
-METADATA is the metadata plist used to render PLIST with, as
-returned by the Jupyter kernel. METADATA typically contains
-information such as the size of an image to be rendered.
+(cl-defmethod jupyter-org-result ((req jupyter-org-request) plist &optional metadata)
+  "For REQ, return a rendered form of a message PLIST.
+PLIST and METADATA have the same meaning as in
+`jupyter-normalize-data'.
 
+Given the source block parameters of REQ, loop over the mime
+types in `jupyter-org-mime-types' calling
 
-Using the `jupyter-org-request-block-params' of REQ, loop over
-the MIME types in `jupyter-org-mime-types' calling
+    (jupyter-org-result MIME CONTENT PARAMS)
 
-    (jupyter-org-result MIME PARAMS DATA METADATA)
+for each one.  Return the result of the call for the first
+mime-type that has a non-nil result.
 
-for each MIME type. Return the result of the first iteration in
-which the above call returns a non-nil value. PARAMS is the REQ's
-`jupyter-org-request-block-params', DATA and METADATA are the
-data and metadata of the current MIME type.
+MIME is the current mime-type, CONTENT is a property list
 
-If PARAMS has a space separated string associated with its
-:display key like \"image/png html plain\", i.e. MIME subtypes or
-full MIME types, then loop over the corresponding subset of MIME
-types in `jupyter-org-mime-types' in the same order given. This
-adds support for the :display header argument that can be
-passed to Jupyter org-mode source blocks."
-  (cl-assert plist json-plist)
-  (let* ((params (jupyter-org-request-block-params req))
-         (display-mime-types (jupyter-org--find-mime-types
-                              (alist-get :display params))))
-    (when (jupyter-org-request-file req)
-      (push (cons :file (jupyter-org-request-file req)) params))
-    (cl-destructuring-bind (data metadata)
-        (jupyter-normalize-data plist metadata)
-      (or (jupyter-loop-over-mime
-              (or display-mime-types jupyter-org-mime-types)
-              mime data metadata
-            (jupyter-org-result mime params data metadata))
-          (prog1 nil
-            (warn "No valid mimetype found %s"
-                  (cl-loop for (k _v) on data by #'cddr collect k)))))))
+    (:data ... :metadata ...)
 
-(cl-defmethod jupyter-org-result ((_mime (eql :application/vnd.jupyter.widget-view+json))
-                                  _params _data &optional _metadata)
+containing the data of the mime-type and PARAMS are the source
+block parameters.
+
+If the source block parameters have a value for the :display
+header argument, like \"image/png html plain\", then loop over
+those mime types instead."
+  (or (and (stringp plist) plist)     ; Pass strings unaffected, Org
+                                        ; treats them as valid elements.
+      (let* ((mime-types (jupyter-org-display-mime-types req))
+             (params (jupyter-org-request-block-params req)))
+        (cl-assert plist json-plist)
+        ;; Push :file back into PARAMS if it was present in
+        ;; `org-babel-execute:jupyter'.  That function removes it because
+        ;; we don't want `org-babel-insert-result' to handle it.
+        (when (jupyter-org-request-file req)
+          (push (cons :file (jupyter-org-request-file req)) params))
+        (or (org-with-point-at
+                (jupyter-org-request-marker req)
+              (jupyter-map-mime-bundle mime-types
+                  (jupyter-normalize-data plist metadata)
+                (lambda (mime content)
+                  (jupyter-org-result mime content params))))
+            (let ((warning
+                   (format
+                    "%s did not return requested mimetype(s): %s"
+                    (jupyter-message-type (jupyter-request-last-message req))
+                    mime-types)))
+              (display-warning 'jupyter warning)
+              nil)))))
+
+(cl-defmethod jupyter-org-result ((_mime (eql :application/vnd.jupyter.widget-view+json)) _content _params)
   ;; TODO: Clickable text to open up a browser
   (jupyter-org-scalar "Widget"))
 
-(cl-defmethod jupyter-org-result ((_mime (eql :text/org)) _params data
-                                  &optional _metadata)
-  (jupyter-org-raw-string data))
+(defvar org-table-line-regexp)
 
-(cl-defmethod jupyter-org-result ((mime (eql :image/png)) params data
-                                  &optional metadata)
-  (jupyter-org--image-result mime params 'b64-encoded data metadata))
+(cl-defmethod jupyter-org-result ((_mime (eql :text/org)) content _params)
+  (let ((data (plist-get content :data)))
+    (if (string-match-p org-table-line-regexp data)
+        (jupyter-org-table-string data)
+      (jupyter-org-raw-string data))))
 
-(cl-defmethod jupyter-org-result ((mime (eql :image/jpeg)) params data
-                                  &optional metadata)
-  (jupyter-org--image-result mime params 'b64-encoded data metadata))
+(cl-defmethod jupyter-org-result ((mime (eql :image/png)) content params)
+  (jupyter-org--image-result mime content params 'b64-encoded))
 
-(cl-defmethod jupyter-org-result ((mime (eql :image/svg+xml)) params data
-                                  &optional metadata)
-  (jupyter-org--image-result mime params nil data metadata))
+(cl-defmethod jupyter-org-result ((mime (eql :image/jpeg)) content params)
+  (jupyter-org--image-result mime content params 'b64-encoded))
 
-(cl-defmethod jupyter-org-result ((_mime (eql :text/markdown)) params data
-                                  &optional _metadata)
-  (jupyter-org-export-block-or-pandoc "markdown" data params))
+(cl-defmethod jupyter-org-result ((mime (eql :image/svg+xml)) content params)
+  (jupyter-org--image-result mime content params))
+
+(cl-defmethod jupyter-org-result ((_mime (eql :text/markdown)) content params)
+  (jupyter-org-export-block-or-pandoc
+   "markdown" (plist-get content :data) params))
 
 (defun jupyter-org--parse-latex-element (data)
   "Return a latex-fragment or latex-environment org-element obtained from DATA.
 DATA is inserted into a temporary buffer and an org-element latex
-fragment or environment is parsed and returned. If neither can be
+fragment or environment is parsed and returned.  If neither can be
 parsed, wrap DATA in a minipage environment and return it."
   (with-temp-buffer
     (insert data)
-    (goto-char (point-min))
-    ;; Try to determine if we are in an environment or fragment
-    (if (save-excursion
-          (forward-char 2)
-          (org-inside-LaTeX-fragment-p))
-        (org-element-latex-fragment-parser)
-      ;; If we are not in a fragment, try to parse an environment
-      (let ((env (ignore-errors
-                   (org-element-latex-environment-parser
-                    (point-max) nil))))
-        (if (eq (org-element-type env) 'latex-environment) env
-          ;; If all else fails, wrap DATA in a minipage
-          ;; environment
-          (jupyter-org-latex-environment
-           (concat "\
+    (let ((elts (org-element-map (org-element-parse-buffer)
+                    '(latex-fragment latex-environment) 'identity)))
+      (cond ((and (= (length elts) 1) (car elts)))
+            (t
+             ;; If all else fails, wrap DATA in a minipage environment
+             (org-element-create 'latex-environment (list :value (concat "\
 \\begin{minipage}{\\textwidth}
 \\begin{flushright}\n" data "\n\\end{flushright}
-\\end{minipage}")))))))
+\\end{minipage}"))))))))
 
-(cl-defmethod jupyter-org-result ((_mime (eql :text/latex)) params data
-                                  &optional _metadata)
+(cl-defmethod jupyter-org-result ((_mime (eql :text/latex)) content params)
   (if (member "raw" (alist-get :result-params params))
-      (jupyter-org--parse-latex-element data)
-    (jupyter-org-export-block-or-pandoc "latex" data params)))
+      (jupyter-org--parse-latex-element (plist-get content :data))
+    (jupyter-org-export-block-or-pandoc
+     "latex" (plist-get content :data) params)))
 
-(cl-defmethod jupyter-org-result ((_mime (eql :text/html)) params data
-                                  &optional _metadata)
-  (jupyter-org-export-block-or-pandoc "html" data params))
+(cl-defmethod jupyter-org-result ((_mime (eql :text/html)) content params)
+  (jupyter-org-export-block-or-pandoc "html" (plist-get content :data) params))
 
-;; NOTE: The order of :around methods is that the more specialized wraps the
-;; more general, this makes sense since it is how the primary methods work as
-;; well.
+;; NOTE: The order of :around methods is that the more specialized
+;; wraps the more general, this makes sense since it is how the
+;; primary methods work as well.
 ;;
-;; Using an :around method to attempt to guarantee that this is called as the
-;; outer most method. Kernel languages should extend the primary method.
-(cl-defmethod jupyter-org-result :around ((_mime (eql :text/plain)) params _data
-                                          &optional _metadata)
+;; Using an :around method to attempt to guarantee that this is called
+;; as the outer most method.  Kernel languages should extend the
+;; primary method.
+(cl-defmethod jupyter-org-result :around ((_mime (eql :text/plain)) _content params)
   "Do some final transformations of the result.
 Call the next method, if it returns \"scalar\" results, return a
 new \"scalar\" result with the result of calling
@@ -1027,36 +1113,44 @@ new \"scalar\" result with the result of calling
     (jupyter-org-scalar
      (cond
       ((and (stringp result)
+            ;; Don't assume non-empty string, see #144
+            (not (zerop (length result)))
             ;; Don't attempt to create a table when we just want scalar results
             ;; FIXME: `jupyter-org-scalar' also considers a table a scalar, but
             ;; `org-mode' doesn't.
             (not (member "scalar" (alist-get :result-params params)))
-            ;; Be a little more stringent than `org-babel-script-escape'. It
+            ;; Be a little more stringent than `org-babel-script-escape'.  It
             ;; gives bad results on the following
             ;;
             ;;     [1] Foo bar
             (when-let* ((beg (car (memq (aref result 0) '(?\[ ?\{ ?\())))
-                        (end (and beg (pcase beg
-                                        (?\[ ?\])
-                                        (?\{ ?\})
-                                        (?\( ?\))))))
+                        (end (pcase beg
+                               (?\[ ?\])
+                               (?\{ ?\})
+                               (?\( ?\)))))
               (eq end (aref result (1- (length result))))))
        (org-babel-script-escape result))
       (t result)))))
 
-(cl-defmethod jupyter-org-result ((_mime (eql :text/plain)) _params data
-                                  &optional _metadata)
-  data)
+(cl-defmethod jupyter-org-result ((_mime (eql :text/plain)) content _params)
+  (plist-get content :data))
 
 ;;;; Helper functions
 
+(defsubst jupyter-org--first-result-context-p (context)
+  (cl-case (org-element-type context)
+    (drawer (not (equal "RESULTS"
+                        (upcase (org-element-property :drawer-name context)))))
+    (t (not (jupyter-org--wrappable-element-p context)))))
+
 (defun jupyter-org--clear-request-id (req)
   "Delete the ID of REQ in the `org-mode' buffer if present."
-  (org-with-point-at (jupyter-org-request-marker req)
-    (when (search-forward (jupyter-request-id req) nil t)
-      (delete-region (line-beginning-position)
-                     (1+ (line-end-position)))
-      (setf (jupyter-org-request-id-cleared-p req) t))))
+  (unless (jupyter-org-request-id-cleared-p req)
+    (org-with-point-at (jupyter-org-request-marker req)
+      (when (search-forward (jupyter-request-id req) nil t)
+        (delete-region (line-beginning-position)
+                       (1+ (line-end-position)))
+        (setf (jupyter-org-request-id-cleared-p req) t)))))
 
 (defun jupyter-org-element-begin-after-affiliated (element)
   "Return the beginning position of ELEMENT after any affiliated keywords."
@@ -1075,32 +1169,28 @@ new \"scalar\" result with the result of calling
         (goto-char (jupyter-org-element-end-before-blanks element))
         (line-beginning-position 0))))
 
-(defun jupyter-org--delete-element (element)
-  "Delete an `org' ELEMENT from the buffer.
-Leave its affiliated keywords and preserve any blank lines that
-appear after the element."
-  (delete-region (jupyter-org-element-begin-after-affiliated element)
-                 (jupyter-org-element-end-before-blanks element))
-  ;; Delete a blank line after the element
-  (when (eq (char-after) ?\n)
-    (delete-char 1)))
+(defun jupyter-org-delete-blank-line ()
+  "If the current line is blank, delete it."
+  (when (looking-at-p "^[\t ]*$")
+    (delete-region (line-beginning-position)
+                   (min (point-max) (1+ (line-end-position))))))
 
 (defun jupyter-org-strip-last-newline (string)
   "Return STRING with its last newline removed."
   (replace-regexp-in-string "\n\\'" "" string))
 
-(defun jupyter-org--insert-element (element)
-  "Insert ELEMENT."
-  ;; `org-element-interpret-data' will add the newline back.
-  (when (eq (char-after) ?\n)
-    (delete-char 1))
-  (insert (org-element-interpret-data element)))
+(defun jupyter-org-delete-element (element)
+  "Delete an `org' ELEMENT from the buffer.
+Leave its affiliated keywords and preserve any blank lines that
+appear after the element."
+  (delete-region (jupyter-org-element-begin-after-affiliated element)
+                 (jupyter-org-element-end-before-blanks element)))
 
 (defun jupyter-org-babel-result-p (result)
   "Return non-nil if RESULT can be removed by `org-babel-remove-result'."
   (or (and (stringp result)
-           ;; Org tables are returned as strings by this time. So we need
-           ;; something to distinguish them from regular strings. See
+           ;; Org tables are returned as strings by this time.  So we need
+           ;; something to distinguish them from regular strings.  See
            ;; `jupyter-org-scalar'.
            (get-text-property 0 'org-table result))
       (memq (org-element-type result)
@@ -1108,52 +1198,37 @@ appear after the element."
               export-block fixed-width item
               link plain-list src-block table))))
 
+;;;; Wrapping results
+
 (defun jupyter-org--wrappable-element-p (element)
   "Return non-nil if ELEMENT can be removed and wrapped in a drawer."
   (or (jupyter-org-babel-result-p element)
       (let ((type (org-element-type element)))
         (or (memq type '(latex-fragment latex-environment))
-            ;; TODO: Figure out a better way. I predict there will be more
-            ;; situations where a comment would be useful to add. That means
+            ;; TODO: Figure out a better way.  I predict there will be more
+            ;; situations where a comment would be useful to add.  That means
             ;; we would have to verify each one.
             (and (eq type 'comment)
                  (equal jupyter-org--goto-error-string
                         (org-element-property :value element)))))))
 
-;;;; Wrapping results
-
 (defun jupyter-org--wrap-result-maybe (context result)
   "Depending on CONTEXT, wrap RESULT in a drawer."
-  ;; If a keyword is the context, this is the first result.
-  (if (eq (org-element-type context) 'keyword)
-      ;; Only wrap the result if it can't be removed by `org-babel'.
-      (if (jupyter-org-babel-result-p result) result
-        (jupyter-org-results-drawer result))
-    (if (jupyter-org--wrappable-element-p context)
-        (prog1 (jupyter-org-results-drawer context result)
-          ;; Ensure that a #+RESULTS: line is not prepended to context
-          ;; when calling `org-element-interpret-data'.
-          (org-element-put-property context :results nil)
-          ;; Ensure there is no post-blank since
-          ;; `org-element-interpret-data' already normalizes the string.
-          (org-element-put-property context :post-blank nil))
-      result)))
-
-(defun jupyter-org--delete-unwrapped-result (element)
-  "Delete ELEMENT from the buffer.
-If ELEMENT represents a previous result it, along with the result
-about to be inserted, will be wrapped in a drawer."
-  (if (eq (org-element-type element) 'table)
-      ;; The `org-element-contents' of a table is nil which interferes with how
-      ;; `org-element-table-interpreter' works when calling
-      ;; `org-element-interpret-data' so set the contents and delete ELEMENT from the
-      ;; buffer.
-      (org-element-set-contents
-       element (delete-and-extract-region
-                (org-element-property :contents-begin element)
-                (jupyter-org-element-end-before-blanks element)))
-    (when (jupyter-org--wrappable-element-p element)
-      (jupyter-org--delete-element element))))
+  (cond
+   ((jupyter-org--first-result-context-p context)
+    ;; Only wrap the result if it can't be removed by `org-babel'.
+    (if (jupyter-org-babel-result-p result) result
+      (jupyter-org-results-drawer result)))
+   ((jupyter-org--wrappable-element-p context)
+    (prog1 (jupyter-org-results-drawer context result)
+      ;; Ensure that a #+RESULTS: line is not prepended to context when calling
+      ;; `org-element-interpret-data'.
+      (org-element-put-property context :results nil)
+      ;; Ensure there is no post-blank since `org-element-interpret-data'
+      ;; already normalizes the string.
+      (org-element-put-property context :post-blank nil)))
+   (t
+    result)))
 
 ;;;; Stream results
 
@@ -1166,13 +1241,13 @@ about to be inserted, will be wrapped in a drawer."
 (defun jupyter-org--mark-stream-result-newline (result)
   "Remember if RESULT ended in a newline.
 Add a non-nil jupyter-stream-newline property to the most
-recently inserted stream RESULT if it ends in a newline. This is
+recently inserted stream RESULT if it ends in a newline.  This is
 so that `jupyter-org--append-stream-result' can properly insert a
 newline or not before inserting subsequent stream results.
 
 Assumes `point' is at the end of the last source block result."
   (or (stringp result) (setq result (org-element-property :value result)))
-  (when (and result
+  (when (and result (not (zerop (length result)))
              (eq (aref result (1- (length result))) ?\n))
     (when (looking-back "#\\+END_EXAMPLE\n"
                         (line-beginning-position 0))
@@ -1182,7 +1257,7 @@ Assumes `point' is at the end of the last source block result."
 (defun jupyter-org--stream-context-p (context)
   "Determine if CONTEXT is a stream result.
 Return the insertion point to append new stream output if CONTEXT
-is a stream result. Otherwise return nil."
+is a stream result.  Otherwise return nil."
   (save-excursion
     (goto-char (if (eq (org-element-type context) 'drawer)
                    (jupyter-org-element-contents-end context)
@@ -1193,172 +1268,381 @@ is a stream result. Otherwise return nil."
      ;; the line.
      (when (= (line-beginning-position) (point))
        0))
+    (skip-chars-forward " \t")
     (when (looking-at-p "\\(?::[\t ]\\|#\\+END_EXAMPLE\\)")
       (line-end-position (unless (eq (char-after) ?:) 0)))))
+
+(defsubst jupyter-org--append-stream-result-p (context result)
+  "Depending on CONTEXT, return the position where RESULT should be appended.
+Return nil if CONTEXT does not represent a previous stream result
+already present in the buffer or if RESULT is not a stream
+result."
+  (and (jupyter-org--stream-result-p result)
+       (not (jupyter-org--first-result-context-p context))
+       (jupyter-org--stream-context-p context)))
+
+;; Adapted from `jupyter-handle-control-codes'
+(defun jupyter-org--handle-control-codes (beg end)
+  "Handle any control sequences between BEG and END."
+  (save-excursion
+    (goto-char beg)
+    (while (< (point) end)
+      (let ((char (char-after)))
+        (cond
+         ((eq char ?\r)
+          (if (< (1+ (point)) end)
+              (if (memq (char-after (1+ (point)))
+                        '(?\n ?\r))
+                  (delete-char 1)
+                (let ((end (1+ (point))))
+                  (beginning-of-line)
+                  (when (looking-at-p ": ")
+                    (forward-char 2))
+                  (delete-region (point) end)))
+            (add-text-properties (point) (1+ (point))
+                                 '(invisible t))
+            (forward-char)))
+         ((eq char ?\a)
+          (delete-char 1)
+          (beep))
+         ((eq char ?\C-h)
+          ;; FIXME: Consider fixed width regions
+          (delete-region (1- (point)) (1+ (point))))
+         (t
+          (forward-char)))))))
 
 ;;;;; Fixed width -> example block promotion
 
 (defun jupyter-org--fixed-width-to-example-block (element result keep-newline)
   "Replace the fixed-width ELEMENT with an example-block.
-Append RESULT to the contents of the block. If KEEP-NEWLINE is
+Append RESULT to the contents of the block.  If KEEP-NEWLINE is
 non-nil, ensure that the appended RESULT begins on a newline."
-  (jupyter-org--delete-element element)
-  (jupyter-org--insert-element
-   (jupyter-org-example-block
-    (concat
-     ;; TODO: optimize this
-     (let ((old-result
-            (org-element-normalize-string
-             (org-element-property :value element))))
-       (if keep-newline old-result
-         (substring old-result 0 -1)))
-     result))))
-
-(defsubst jupyter-org--fixed-width-append (result keep-newline)
-  (if (not (or keep-newline (string-match "\n" result)))
-      (insert result)
-    (if keep-newline (insert "\n")
-      (insert (substring result 0 (match-end 0))))
-    (jupyter-org--insert-element
-     (jupyter-org-scalar
-      (jupyter-org-strip-last-newline
-       (if keep-newline result
-         (substring result (match-end 0))))))))
-
-(defun jupyter-org--append-to-fixed-width (result keep-newline)
-  "Append RESULT to the fixed-width element at point.
-`point' is assumed to be at the insertion point. If KEEP-NEWLINE is
-non-nil, ensure that the appended RESULT begins on a newline.
-
-If appending RESULT causes the total number of lines to exceed
-`org-babel-min-lines-for-block-output' replace the fixed-width
-element by an example-block containing both the original contents
-of the fixed-width element and RESULT concatenated together.
-
-If RESULT ends in a newline, place a non-nil
-jupyter-stream-newline property on the ending newline after
-insertion into the buffer."
-  (let* ((context (org-element-at-point))
-         (promote-to-block-p
-          (>= (+ (count-lines
-                  (jupyter-org-element-begin-after-affiliated context)
-                  (jupyter-org-element-end-before-blanks context))
-                 (cl-loop
-                  with i = 0
-                  for c across result when (eq c ?\n) do (cl-incf i)
-                  finally return i))
-              org-babel-min-lines-for-block-output)))
-    (if promote-to-block-p
-        (jupyter-org--fixed-width-to-example-block context result keep-newline)
-      (jupyter-org--fixed-width-append result keep-newline))))
+  (jupyter-org-delete-element element)
+  ;; Delete a newline that will be re-inserted by `org-element-interpret-data'.
+  (when (eq (char-after) ?\n)
+    (delete-char 1))
+  (insert (org-element-interpret-data
+           (jupyter-org-example-block
+            (concat
+             (let ((old-result
+                    (org-element-normalize-string
+                     (org-element-property :value element))))
+               (if keep-newline old-result
+                 (substring old-result 0 -1)))
+             result)))))
 
 ;;;;; Append stream result
 
+(defun jupyter-org--append-to-fixed-width (result keep-newline)
+  "Append RESULT to the fixed-width element at point.
+`point' is assumed to be at the insertion point.  If KEEP-NEWLINE is
+non-nil, ensure that the appended RESULT begins on a newline."
+  (save-match-data
+    (let ((first-newline (string-match "\n" result)))
+      (if (not (or first-newline keep-newline))
+          (insert result)
+        (let (head tail)
+          (if keep-newline
+              (setq head "\n"
+                    tail result)
+            (setq head (substring result 0 (1+ first-newline))
+                  tail (substring result (1+ first-newline))))
+          (insert head)
+          ;; Delete the newline that will be re-inserted by
+          ;; `org-element-interpret-data'
+          (when (eq (char-after) ?\n)
+            (delete-char 1))
+          (unless (string-empty-p tail)
+            (insert (thread-last tail
+                      jupyter-org-strip-last-newline
+                      jupyter-org-scalar
+                      org-element-interpret-data))))))))
+
+(defun jupyter-org--append-to-example-block (result keep-newline)
+  "Append RESULT to the end of the current example block.
+`point' is assumed to be at the end of the last line of the
+example block contents.
+
+If KEEP-NEWLINE is non-nil, add a newline before appending
+RESULT."
+  ;; Delete the newline that will be re-inserted by the call to
+  ;; `org-element-normalize-string'.
+  (when (eq (char-after) ?\n)
+    (delete-char 1))
+  (setq result (org-element-normalize-string result))
+  ;; From `org-element-example-block-interpreter'
+  (when (and (not org-src-preserve-indentation)
+             (/= 0 org-edit-src-content-indentation)
+             (version<= "9.2" (org-version)))
+    (let ((ind (make-string org-edit-src-content-indentation ?\s))
+          head tail)
+      (if keep-newline
+          (setq head ""
+                tail result)
+        (let ((first-newline (save-match-data
+                               (string-match "\n" result))))
+          (setq head (substring result 0 (1+ first-newline))
+                tail (substring result (1+ first-newline)))))
+      (setq result (concat head (replace-regexp-in-string
+                                 "^[ \t]*\\S-"
+                                 (concat ind "\\&")
+                                 (org-remove-indentation tail))))))
+  (insert (concat (when keep-newline "\n") result)))
+
 (defun jupyter-org--append-stream-result (result)
-  (let ((keep-newline (get-text-property (point) 'jupyter-stream-newline)))
-    (if (eq (char-after (line-beginning-position)) ?:)
-        (jupyter-org--append-to-fixed-width result keep-newline)
-      ;; Append at the end of the current example-block. In this case
-      ;; POS is the end of the last line of contents.
-      ;;
-      ;;     ...
-      ;;     foo|
-      ;;     #+END_EXAMPLE
-      ;;
-      ;; Delete the newline that will be re-inserted by the call to
-      ;; `org-element-normalize-string'.
-      (delete-char 1)
-      (setq result (org-element-normalize-string result))
-      ;; From `org-element-example-block-interpreter'
-      (when (and (not org-src-preserve-indentation)
-                 (/= 0 org-edit-src-content-indentation)
-                 (version<= "9.2" (org-version)))
-        (let ((ind (make-string org-edit-src-content-indentation ?\s)))
-          (setq result (replace-regexp-in-string
-                        "^[ \t]*\\S-"
-                        (concat ind "\\&")
-                        (org-remove-indentation result)))))
-      (insert (concat (when keep-newline "\n") result)))))
+  "Append a stream RESULT.
+Either append to the current fixed-width element or example block.
+
+When appending to fixed-width elements, if appending RESULT
+causes the total number of lines to exceed
+`org-babel-min-lines-for-block-output' replace the fixed-width
+element by an example-block containing both the original contents
+of the fixed-width element and RESULT concatenated together."
+  (let ((keep-newline (get-text-property (point) 'jupyter-stream-newline))
+        (context (org-element-at-point)))
+    (cond
+     ((eq (org-element-type context) 'fixed-width)
+      (let ((promote-to-block-p
+             (>= (+ (count-lines
+                     (jupyter-org-element-begin-after-affiliated context)
+                     (jupyter-org-element-end-before-blanks context))
+                    (cl-loop
+                     with i = 0
+                     for c across result when (eq c ?\n) do (cl-incf i)
+                     finally return i))
+                 org-babel-min-lines-for-block-output)))
+        (if promote-to-block-p
+            (jupyter-org--fixed-width-to-example-block context result keep-newline)
+          (jupyter-org--append-to-fixed-width result keep-newline))))
+     (t
+      (jupyter-org--append-to-example-block result keep-newline)))))
+
+(defsubst jupyter-org--prepare-append-result (context)
+  "Depending on CONTEXT do something to prepare for inserting a result.
+
+- If CONTEXT is a drawer move `point' to the end of its contents.
+
+- If CONTEXT is a table, delete it from the buffer and set the
+  deleted text as the contents of CONTEXT.
+
+- Otherwise, if CONTEXT is a previous unwrapped result, delete it
+  from the buffer.  An unwrapped result is a previous result not
+  wrapped in a drawer."
+  (cl-case (org-element-type context)
+    ;; Go to the end of the drawer to insert the new result.
+    (drawer
+     (goto-char (jupyter-org-element-contents-end context)))
+    ;; Any other context that looks like a result needs to be removed
+    ;; since it, along with the new result will be wrapped in a drawer
+    ;; and re-inserted into the buffer.
+    (table
+     ;; The `org-element-contents' of a table is nil which interferes
+     ;; with how `org-element-table-interpreter' works when calling
+     ;; `org-element-interpret-data' so set the contents and delete
+     ;; CONTEXT from the buffer.
+     (org-element-set-contents
+      context (delete-and-extract-region
+               (org-element-property :contents-begin context)
+               (jupyter-org-element-end-before-blanks context))))
+    (t
+     (when (jupyter-org--wrappable-element-p context)
+       (jupyter-org-delete-element context)
+       (jupyter-org-delete-blank-line)))))
 
 ;;;; Insert result
 
-(defun jupyter-org--insert-result (context result)
+(defmacro jupyter-org-indent-inserted-region (indentation &rest body)
+  "Indent the region inserted by BODY using INDENTATION.
+If INDENTATION is nil, it defaults to `current-indentation'."
+  (declare (indent 1))
+  (let ((indent (make-symbol "indent")))
+    `(let ((,indent ,(or indentation '(current-indentation))))
+       (jupyter-with-insertion-bounds
+           beg end (progn ,@body)
+         (when (and (numberp ,indent) (> ,indent 0))
+           (indent-rigidly beg end ,indent))))))
+
+(defvar org-bracket-link-regexp)
+
+(defsubst jupyter-org--normalized-insertion-context ()
+  "Return an `org-element' of the current results context.
+Assumes `point' is on the #+RESULTS keyword line."
+  (let ((context (org-element-context)))
+    ;; Handle file links which are org element objects and are contained
+    ;; within paragraph contexts.
+    (when (eq (org-element-type context) 'paragraph)
+      (save-excursion
+        (goto-char (jupyter-org-element-begin-after-affiliated context))
+        (when (looking-at-p (format "^[ \t]*%s[ \t]*$" org-bracket-link-regexp))
+          (setq context (org-element-context)))))
+    context))
+
+(defun jupyter-org--do-insert-result (req result)
+  (pcase-let (((cl-struct jupyter-org-request
+                          marker inline-block-p block-params client)
+               req))
+    (org-with-point-at marker
+      (if inline-block-p
+          (org-babel-insert-result
+           (if (stringp result) result
+             (or (org-element-property :value result) ""))
+           (alist-get :result-params block-params)
+           nil nil (jupyter-kernel-language client))
+        (let ((res-begin (org-babel-where-is-src-block-result 'insert)))
+          (goto-char res-begin)
+          (let* ((indent (current-indentation))
+                 (context (jupyter-org--normalized-insertion-context))
+                 (pos (jupyter-org--append-stream-result-p context result)))
+            (if pos (goto-char pos)
+              (forward-line 1)
+              (unless (bolp) (insert "\n"))
+              (jupyter-org--prepare-append-result context))
+            (jupyter-org-indent-inserted-region indent
+              (if pos (jupyter-org--append-stream-result result)
+                (jupyter-org--insert-result req context result)))
+            (when (jupyter-org--stream-result-p result)
+              (let ((end (point-marker)))
+                (unwind-protect
+                    (jupyter-org--handle-control-codes
+                     (if pos (save-excursion
+                               (goto-char pos)
+                               ;; Go back one line to account for an edge case
+                               ;; where a control code is at the end of a line.
+                               (line-beginning-position 0))
+                       res-begin)
+                     end)
+                  (set-marker end nil)))
+              (jupyter-org--mark-stream-result-newline result))))))))
+
+(defun jupyter-org--start-pandoc-conversion (el cb)
+  (jupyter-pandoc-convert
+   (org-element-property :type el) "org"
+   (org-element-property :value el)
+   cb))
+
+;; A simplification of `text-property-search-forward' in Emacs >= 27
+;; used for our purposes.
+(defun jupyter-org--search-for-text-property (property value)
+  (let ((origin (point))
+        (ended nil)
+        pos)
+    ;; Fix the next candidate.
+    (while (not ended)
+      (setq pos (next-single-property-change (point) property))
+      (if (not pos)
+          (progn
+            (goto-char origin)
+            (setq ended t))
+        (goto-char pos)
+        (when (eq value (get-text-property (point) property))
+          (setq ended 'found))))
+    (and (not (eq ended t))
+         ended)))
+
+(defun jupyter-org-pandoc-placeholder-element (req el)
+  "Launch a Pandoc conversion process of EL, return a placeholder string.
+REQ is the `jupyter-org-request' which generated EL as a result.
+
+The placeholder string is meant to be inserted into the Org
+buffer and replaced with the result of conversion when ready.
+
+EL is an Org element with the properties
+
+    :text  The placeholder text to use.
+    :type  The type of syntax from which to convert.
+    :value The code with the corresponding syntax."
+  (letrec ((buf (current-buffer))
+           (src-pos (copy-marker (jupyter-org-request-marker req)))
+           (cb (lambda ()
+                 (let ((to-string (buffer-string)))
+                   (with-current-buffer buf
+                     (save-excursion
+                       (goto-char src-pos)
+                       (set-marker src-pos nil)
+                       (when (jupyter-org--search-for-text-property 'jupyter-pandoc proc)
+                         (delete-region (point)
+                                        (let ((pos (next-single-property-change
+                                                    (point) 'jupyter-pandoc)))
+                                          (if pos (1+ pos)
+                                            (point-max))))
+                         (insert to-string)))))))
+           (proc (jupyter-org--start-pandoc-conversion el cb)))
+    (jupyter-org-raw-string
+     (propertize
+      (org-element-property :text el)
+      'jupyter-pandoc proc))))
+
+(cl-defgeneric jupyter-org--insert-result (req context result)
+  "For REQ and given CONTEXT, insert RESULT.
+REQ is a `jupyter-org-request' that contains the context of the
+source block for which RESULT will be inserted as a result of.
+
+CONTEXT is the `org-element-context' for the results of the
+source block associated with REQ.
+
+RESULT is the new result, as an org element, to be inserted.")
+
+(cl-defmethod jupyter-org--insert-result (req context result)
+  (when (eq (org-element-type result) 'pandoc)
+    (setq result (jupyter-org-pandoc-placeholder-element req result)))
+
   (insert (org-element-interpret-data
            (jupyter-org--wrap-result-maybe
             context (if (jupyter-org--stream-result-p result)
-                        (jupyter-org-scalar
-                         (jupyter-org-strip-last-newline result))
+                        (thread-last result
+                          jupyter-org-strip-last-newline
+                          jupyter-org-scalar)
                       result))))
-  (when (/= (point) (line-beginning-position))
+  (when (or (/= (point) (line-beginning-position))
+            (eq (org-element-type context) 'example-block))
     ;; Org objects such as file links do not have a newline added when
     ;; converting to their string representation by
     ;; `org-element-interpret-data' so insert one in these cases.
     (insert "\n")))
 
-;;;; Add/append results
+(cl-defmethod jupyter-org--insert-result :after (_req _context result)
+  "Toggle display of LaTeX fragment results.
+See `jupyter-org-toggle-latex'."
+  (when (and jupyter-org-toggle-latex
+             (memq (org-element-type result)
+                   '(latex-fragment latex-environment)))
+    (save-excursion
+      ;; Go to a position contained in the fragment
+      (forward-line -1)
+      (skip-syntax-forward "-")
+      (let ((ov (car (overlays-at (point)))))
+        (unless (and ov (eq (overlay-get ov 'org-overlay-type)
+                            'org-latex-overlay))
+          (org-toggle-latex-fragment))))))
 
-(defun jupyter-org--append-result (req result)
-  (org-with-point-at (jupyter-org-request-marker req)
-    (let ((result-beg (org-babel-where-is-src-block-result 'insert))
-          (inhibit-redisplay (not debug-on-error)))
-      (goto-char result-beg)
-      ;; Move past the #+RESULTS: keyword. This is needed so that we can pick
-      ;; up object contexts like file links as opposed to paragraph contexts.
-      (forward-line)
-      (let* ((context (org-element-context))
-             (stream-append-pos
-              (and (jupyter-org--stream-result-p result)
-                   (jupyter-org--stream-context-p context))))
-        (cond
-         (stream-append-pos
-          (goto-char stream-append-pos)
-          (jupyter-org--append-stream-result result))
-         (t
-          (cl-case (org-element-type context)
-            ;; Go to the end of the drawer to insert the new result.
-            (drawer
-             (goto-char (jupyter-org-element-contents-end context)))
-            ;; Insert the first result. In this case `point' is at the first
-            ;; line after the #+RESULTS keyword.
-            (keyword nil)
-            ;; Any other context is a previous result. Remove it from the
-            ;; buffer since it, along with the new result will be wrapped in a
-            ;; drawer and re-inserted into the buffer.
-            (t
-             (jupyter-org--delete-unwrapped-result context)))
-          (jupyter-org--insert-result context result)
-          (when jupyter-org-toggle-latex
-            (when (memq (org-element-type result)
-                        '(latex-fragment latex-environment))
-              (save-excursion
-                ;; Go to a position contained in the fragment
-                (forward-line -1)
-                (let ((ov (car (overlays-at (point)))))
-                  (unless (and ov (eq (overlay-get ov 'org-overlay-type)
-                                      'org-latex-overlay))
-                    (org-toggle-latex-fragment))))))))
-        (when (jupyter-org--stream-result-p result)
-          (jupyter-org--mark-stream-result-newline result))))))
+;;;; Add result
 
-(defun jupyter-org--add-result (req result)
-  "For REQ, add RESULT.
-For a synchronous request, RESULT is added to REQ's results slot
-and all results are processed once the src-block has finished
-running.
-
-For an asynchronous request, RESULT is appended directly to the
-buffer."
-  (if (jupyter-org-request-silent-p req)
-      (unless (equal (jupyter-org-request-silent-p req) "none")
-        (message "%s" (org-element-interpret-data result)))
-    (cond
-     ((jupyter-org-request-async req)
-      (when (and (jupyter-org-request-async req)
-                 (not (jupyter-org-request-id-cleared-p req)))
-        (jupyter-org--clear-request-id req))
-      (jupyter-org--append-result req result))
-     (t
-      (push result (jupyter-org-request-results req))))))
+(defun jupyter-org--add-result (req data &optional metadata)
+  (let ((org-element-p
+         (lambda (data)
+           (let ((type (org-element-type data)))
+             (or (eq type 'plain-text)
+                 (memq type org-element-all-objects)
+                 (memq type org-element-all-elements))))))
+    (pcase-let (((cl-struct jupyter-org-request async-p silent-p) req))
+      (when (equal silent-p "silent")
+        (message "%s" (if (funcall org-element-p data)
+                          (org-element-interpret-data data)
+                        (jupyter-map-mime-bundle (jupyter-org-display-mime-types req)
+                            (jupyter-normalize-data data metadata)
+                          (lambda (_mime content)
+                            (org-babel-script-escape (plist-get content :data)))))))
+      (cond
+       (async-p
+        (jupyter-org--clear-request-id req)
+        (unless silent-p
+          (jupyter-org--do-insert-result
+           req (if (funcall org-element-p data) data
+                 (jupyter-org-result req data metadata)))))
+       (t
+        (push (if (stringp data) data
+                (list :data data :metadata metadata))
+              (jupyter-org-request-results req)))))))
 
 ;;; org-babel functions
 ;; These are meant to be called by `org-babel-execute:jupyter'
@@ -1375,14 +1659,14 @@ the return value for asynchronous Jupyter source blocks in
 `org-babel-execute:jupyter'."
   (prog1 nil
     (let ((log-max message-log-max)
-          (hook org-babel-after-execute-hook)
-          (id (jupyter-org-scalar (jupyter-org-request-id req))))
+          (hook org-babel-after-execute-hook))
       (setq message-log-max nil)
       (setq org-babel-after-execute-hook
             (list (lambda ()
                     (setq message-log-max log-max)
                     (unwind-protect
-                        (jupyter-org--add-result req id)
+                        (jupyter-org--add-result
+                         req (list :text/plain (jupyter-org-request-id req)))
                       (setq org-babel-after-execute-hook hook)
                       (run-hooks 'org-babel-after-execute-hook))))))))
 
@@ -1390,42 +1674,71 @@ the return value for asynchronous Jupyter source blocks in
   "Return RESULTS with all contiguous stream results concatenated.
 All stream results are then turned into fixed-width or
 example-block elements."
-  (let ((head-to-scalar
-         (lambda (a)
-           ;; Convert the head element of A to a scalar if its a
-           ;; stream result, return A.
-           (when (jupyter-org--stream-result-p (car a))
-             (setcar a (jupyter-org-scalar
-                        (jupyter-org-strip-last-newline (car a)))))
-           a)))
-    (nreverse
-     (funcall
-      head-to-scalar
-      (cl-reduce
-       (lambda (a b)
-         (if (and (jupyter-org--stream-result-p b)
-                  (jupyter-org--stream-result-p (car a)))
-             (setcar a (concat (car a) b))
-           (funcall head-to-scalar a)
-           (push b a))
-         a)
-       results
-       :initial-value nil)))))
+  (let (lst str)
+    (while (consp results)
+      (let ((value (pop results)))
+        (if (jupyter-org--stream-result-p value)
+            (cl-callf concat str value)
+          (when str
+            (push str lst)
+            (setq str nil))
+          (push value lst))))
+    (when str
+      (push str lst))
+    (nreverse lst)))
+
+(defun jupyter-org--process-pandoc-results (results)
+  (let* ((results (copy-sequence results))
+         (head results)
+         (procs '()))
+    (while head
+      (when (eq (org-element-type (car head)) 'pandoc)
+        (push
+         (jupyter-org--start-pandoc-conversion
+          (car head)
+          (let ((h head))
+            (lambda ()
+              (setcar h (jupyter-org-raw-string (buffer-string))))))
+         procs))
+      (setq head (cdr head)))
+    (while (cl-find-if #'process-live-p procs)
+      (accept-process-output nil 0.1))
+    results))
 
 (defun jupyter-org-sync-results (req)
   "Return the result string in org syntax for the results of REQ.
 Meant to be used as the return value of
 `org-babel-execute:jupyter'."
-  (when-let* ((results (jupyter-org--coalesce-stream-results
-                        (nreverse (jupyter-org-request-results req))))
-              (params (jupyter-org-request-block-params req))
-              (result-params (alist-get :result-params params)))
-    (org-element-interpret-data
-     (if (or (and (= (length results) 1)
-                  (jupyter-org-babel-result-p (car results)))
-             (member "raw" result-params))
-         (car results)
-       (apply #'jupyter-org-results-drawer results)))))
+  (pcase-let (((cl-struct jupyter-org-request block-params
+                          results silent-p block-params)
+               req))
+    (setq results (jupyter-org--coalesce-stream-results (nreverse results)))
+    (if silent-p
+        (org-babel-script-escape
+         (mapconcat
+          (lambda (result)
+            (if (consp result)
+                (or (jupyter-mime-value result :text/plain) "")
+              (cl-check-type result string)
+              result))
+          results
+          "\n"))
+      (when-let* ((results
+                   (mapcar (lambda (r)
+                        (if (jupyter-org--stream-result-p r)
+                            (jupyter-org-scalar
+                             (jupyter-org-strip-last-newline r))
+                          r))
+                      (jupyter-org--process-pandoc-results
+                       (mapcar (lambda (result) (jupyter-org-result req result))
+                          results))))
+                  (result-params (alist-get :result-params block-params)))
+        (org-element-interpret-data
+         (if (or (and (= (length results) 1)
+                      (jupyter-org-babel-result-p (car results)))
+                 (member "raw" result-params))
+             (car results)
+           (apply #'jupyter-org-results-drawer results)))))))
 
 (provide 'jupyter-org-client)
 

@@ -1,3 +1,187 @@
+* v1.0
+
+- The results of executing named Jupyter source blocks can now be
+  referenced by other source blocks.  In other words, referencing a
+  Jupyter block in the context of noweb expansion, using =org-sbe=, or
+  as the value of a source block variable works now.
+
+- Added the customizable variable =jupyter-org-auto-connect= which
+  determines if a session should automatically be connected to upon
+  the first insertion into a source block's region.
+
+- The Jupyter executable used by underlying calls to =jupyter-command=
+  may now be set using the variable =jupyter-executable=.
+
+- Virtual environments are supported.  If the =VIRTUAL_ENV= environment
+  variable is set, then the available kernels to launch will be those
+  under the virtual environment assuming your =exec-path= is set
+  correctly to contain the Jupyter executable under the virtual
+  environment.  See for
+  example https://github.com/jorgenschaefer/pyvenv.
+
+- Added =org-babel-jupyter-language-aliases= which allows you to change
+  the name of the Org source block for a particular kernel language.
+  Usually the name of the source block is jupyter-LANG where LANG is
+  the name of the kernel language.  This variable allows you to
+  specify something else for LANG.
+
+- Added the =jupyter-use-zmq= variable which determines whether or
+  not =zmq= based connections are available for use.  If this variable
+  is =nil= then only server based connections can be used and in some
+  instances a default notebook server is started to manage those
+  connections, e.g. when calling =jupyter-run-repl=.
+
+* v0.8.3
+
+- Additional bug fixes.
+
+- Fixed a regression that appears when executing an =org-mode= source
+  block of a previously created session.  A new connection to the
+  session was being created before execution instead of using the old
+  connection.  See #240.
+
+- Fixed regression due to uppercase characters in kernel language
+  names, e.g. R.  =emacs-jupyter= would not work at all with language
+  specific features.
+
+* v0.8.2
+
+- Fix recursive loading error caused by =jupyter-tramp.el= autoloads.
+
+- Consider kernelspecs with spaces and uppercase characters in the kernel's
+  language name.
+
+- In =org-mode=, fixed a bug where inline results where being displayed
+  differently from what they would have been when the results are not inline.
+
+- When =jupyter-repl-echo-eval-p= is non-nil, ensure that any cell code not sent
+  to a kernel yet is preserved.
+
+- In =org-mode=, fix a bug where if the =:session= header argument of Jupyter
+  source blocks is a relative file name with a =.json= suffix
+  and =default-directory= is a remote directory, a file on the local machine
+  would be read.
+
+- Use =org-babel-jupyter-async-inline-results-pending-indicator= as a placeholder
+  when evaluating asynchronous inline source blocks in =org-mode=.
+
+- Integrate better with packages like =polymode= when evaluating source blocks
+  in =org-mode= by considering indirect buffers. Thanks to =@dvzubarev= for
+  the [[https://github.com/dzop/emacs-jupyter/issues/171#issuecomment-522762377][solution]].
+
+- Fixed usage of source block parameters when evaluating source blocks
+  using =#+CALL= in =org-mode=. There are many sources of source block parameters
+  that =org-mode= merges to produce the final set of parameters passed
+  to =org-babel-execute:jupyter=, previously that function would just re-compute
+  source block parameters. Now it uses the parameters it was given,
+  see =org-babel-jupyter-current-src-block-params=.
+
+- Add support for displaying evaluation results in the current buffer using
+  overlays. See =jupyter-eval-use-overlays= and the relevant README sections.
+
+- Fix =jupyter-repl-restart-kernel= to restart a kernel using a kernel manager
+  when one is available. Previously, restarting a kernel using that function
+  wouldn't work properly if the kernel was from a notebook server.
+
+- Increase default timeout until a kernel is considered dead to 30 seconds when
+  communicating directly with a kernel. More specifically, if a response from a
+  kernel is not received after three consecutive 10 s periods on the heartbeat
+  channel, the kernel is considered dead. Previously the timeout was five 1 s
+  periods. This should fix =Kernel not alive= errors when using the REPL if the
+  kernel being communicated with was on a slow connection.
+
+- Ensure that a non-default value of =url-cookie-file= is handled properly in the
+  notebook support.
+
+- In =org-mode= handle ANSI control codes in stream output.
+
+- In =org-mode= fix a regression where source block results were not being
+  associated with =#+CALL= Org elements.
+
+- Add support for the Jupyter Notebook REST API. See the relevant sections in
+  the README.
+
+* v0.8.1
+
+- Add the commands =jupyter-org-(next|previous)-busy-src-block= which will jump
+  to the next or previous busy source block in an =org-mode= buffer. Bound to =N=
+  and =P= in the =Hydra= provided in =org-mode= (=C-c h=).
+
+- Add customizable variable =jupyter-org-adjust-image-size= to avoid stretching
+  images when =org-image-actual-width= is set so that it falls back to a default
+  width for an inline image.
+
+- Fix a message buffering issue when sending multiple requests to a kernel in
+  quick succession, e.g. when calling =org-babel-execute-subtree= in =org-mode=
+  when all Jupyter source blocks in the subtree are evaluated asynchronously.
+
+- In =jupyter-org-insert-src-block= (1) adjust whitespace so that there is at
+  least one blank line before and following an inserted source block (2) do not
+  insert a new source block between a source block and its results, always
+  insert the new block after a source block's results (3) do not move past an
+  inlinetask, normally the current paragraph or element under =point= is moved
+  past before inserting a new source block.
+
+- Fix issues with undo in the REPL when trying to undo after inserting a
+  newline. See #139.
+
+- In =org-mode=, detect Org formatted table strings when a kernel returns a
+  =text/org= mimetype. This avoids wrapping the table in a drawer.
+
+- If a file is opened via =emacsclient=, attempt to associate the opened buffer
+  with a REPL client. This is useful, e.g. when using the ~julia~ language's
+  ~edit~ function and the =EDITOR= environment variable is set to
+  =emacsclient=. See ~jupyter-server-mode-set-client~ for more details.
+
+- In =org-mode=, when inserting the results of an asynchronously evaluated
+  src-block, indent the results to match the surrounding indentation level.
+
+- In =org-mode=, fix an issue when a src-block is nested within a list that
+  would cause the entire list to be erased when asynchronously evaluating the
+  src-block.
+
+- Add new customizable variable ~jupyter-repl-echo-eval-p~ that causes the REPL
+  to behave similarly to comint or ESS when evaluating code. Specifically, it
+  causes any code that is sent to the underlying kernel to also be displayed as
+  a REPL input cell. The previous behavior would only display the sent code as
+  an input cell if it was explicitly typed in at the REPL.
+
+- Add the new command ~jupyter-repl-clear-cells~ to clear all of the current
+  input and output cells in a REPL buffer. Bound to ~C-c C-o~ by default in the
+  REPL.
+
+- Fix an issue where timeouts started using ~with-timeout~ would timeout when
+  the kernel requests input from the user. The timeouts are now suspended in
+  such cases.
+
+- In =jupyter-R.el= handle the =isolated= metadata property of HTML results by
+  opening up an external browser to display the result.
+
+- Allow =:session= to be a remote file name for =org-mode= source blocks. When
+  =:session= is a remote file name that doesn't end in =.json=, e.g.
+  =/ssh:ec2:jl=, a new kernel is started on the remote host using the
+  =jupyter kernel= command on that host. The local file name part serves to
+  distinguish different sessions on the remote host.
+
+- Add the new commands ~jupyter-repl-history-previous-matching~ and
+  ~jupyter-repl-history-next-matching~, bound to ~C-c M-r~ and ~C-c M-s~ in the
+  REPL.
+
+- In ~jupyter-with-display-buffer~, ~let~ bind ~jupyter-current-client~. This
+  fixes an issue where kernel language specific methods were not overriding the
+  defaults when attempting to display the contents of =display-data= messages
+  received from a kernel.
+
+- Fix a regression in ~jupyter-available-kernelspecs~ when getting the
+  kernelspecs on remote hosts.
+
+- Handle empty result blocks when stripping ANSI escape sequences during export
+  in ~org-babel-jupyter-strip-ansi-escapes~.
+
+- Call ~downcase~ on the language name when adding to ~org-src-lang-modes~.
+  This fixes an issue with the ~C++~ kernel where the corresponding mode is
+  ~c++-mode~.
+
 * v0.8.0
 
 - Support Windows
@@ -302,42 +486,3 @@
   background of a traceback in the REPL buffer to distinguish it from other
   output. In addition to this face, there is also =jupyter-repl-input-prompt=
   and =jupyter-repl-output-prompt=.
-* How to update this file
-
-Examine the output of
-
-#+NAME: changelog
-#+HEADER: :var PREV_VERSION="v0.8.0" VERSION="master"
-#+BEGIN_SRC shell :results output
-git log --pretty=format:"%s" ${PREV_VERSION}...${VERSION}
-#+END_SRC
-
-and filter down to the most notable changes, summarize each one. Be sure to
-update the =VERSION= variables first.
-
-#+RESULTS: changelog
-
-* Update Version header
-
-Update the =Version= in the header of all source files.
-
-#+BEGIN_SRC elisp :results silent :var version="0.8.0"
-(let ((re "^;; Version: \\(\\([0-9]+\\)\\.\\([0-9]+\\)\\.\\([0-9]+\\)\\)" ))
-  (dolist (file (append (directory-files default-directory nil ".el$")
-                        (directory-files (expand-file-name "test" default-directory) t ".el$")))
-    (let* ((buf (find-buffer-visiting file))
-           (kill (null buf)))
-      (unless buf
-        (setq buf (find-file-noselect file)))
-      (with-current-buffer buf
-        (save-excursion
-          (save-restriction
-            (widen)
-            (goto-char (point-min))
-            (when (re-search-forward re nil t)
-              (replace-match version nil nil nil 1))
-            (save-buffer)
-            (when kill
-              (kill-buffer))))))))
-#+END_SRC
-

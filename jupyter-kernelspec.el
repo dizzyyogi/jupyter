@@ -1,14 +1,13 @@
 ;;; jupyter-kernelspec.el --- Jupyter kernelspecs -*- lexical-binding: t -*-
 
-;; Copyright (C) 2018 Nathaniel Nicandro
+;; Copyright (C) 2018-2024 Nathaniel Nicandro
 
 ;; Author: Nathaniel Nicandro <nathanielnicandro@gmail.com>
 ;; Created: 17 Jan 2018
-;; Version: 0.8.0
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
-;; published by the Free Software Foundation; either version 2, or (at
+;; published by the Free Software Foundation; either version 3, or (at
 ;; your option) any later version.
 
 ;; This program is distributed in the hope that it will be useful, but
@@ -30,104 +29,192 @@
 ;;; Code:
 
 (require 'json)
+(require 'jupyter-env)
 
 (defgroup jupyter-kernelspec nil
   "Jupyter kernelspecs"
   :group 'jupyter)
 
 (declare-function jupyter-read-plist "jupyter-base" (file))
+(declare-function jupyter-read-plist-from-string "jupyter-base" (file))
+
+(cl-defstruct jupyter-kernelspec
+  (name "python"
+        :type string
+        :documentation "The name of the kernelspec."
+        :read-only t)
+  (plist nil
+         :type list
+         :documentation "The kernelspec as a property list."
+         :read-only t)
+  (resource-directory nil
+   :type (or null string)
+   :documentation "The resource directory."
+   :read-only t))
 
 (defvar jupyter--kernelspecs (make-hash-table :test #'equal :size 5)
-  "An alist matching kernel names to their kernelspec directories.")
+  "A hash table mapping hosts to the kernelspecs available on them.
+The top level hash-table maps hosts to nested hash-tables keyed
+on virtual environment path or nil for a system-wide Jupyter
+install: hosts[hash-table] -> venv[hash-table] -> kernelspecs.")
 
-(defun jupyter-read-kernelspec (dir)
-  "Return the kernelspec found in DIR.
-If DIR contains a \"kernel.json\" file, assume that it is the
-kernelspec of a kernel and return the plist created by a call to
-`jupyter-read-plist'."
-  (let ((file (expand-file-name "kernel.json" dir)))
-    (if (file-exists-p file) (jupyter-read-plist file)
-      (error "No kernel.json file found in %s" dir))))
+(defun jupyter-kernelspecs-ensure-cache (host)
+  "Return, creating if necessary, the hash-table for HOST."
+  (let ((cache (gethash host jupyter--kernelspecs)))
+    (if cache cache
+      (puthash host (make-hash-table :test #'equal :size 5)
+               jupyter--kernelspecs))))
+
+(defun jupyter-kernelspecs-cache-put (host kernelspecs)
+  "Cache KERNELSPECS available on HOST.
+This takes into account any currently active virtual
+environment."
+  (let ((venv (getenv "VIRTUAL_ENV")))
+    (let ((cache (jupyter-kernelspecs-ensure-cache host)))
+      (puthash venv kernelspecs cache))))
+
+(defun jupyter-kernelspecs-cache-get (host)
+  "Retrieve cached KERNELSPECS available on HOST.
+This takes into account any currently active virtual
+environment."
+  (let ((venv (getenv "VIRTUAL_ENV")))
+    (let ((cache (jupyter-kernelspecs-ensure-cache host)))
+      (gethash venv cache))))
 
 (defun jupyter-available-kernelspecs (&optional refresh)
-  "Get the available kernelspecs.
-Return an alist mapping kernel names to (DIRECTORY . PLIST) pairs
-where DIRECTORY is the resource directory of the kernel and PLIST
-is its kernelspec plist. The alist is formed by a call to the
+  "Return the available kernelspecs.
+Return a list of `jupyter-kernelspec's available on the host
+associated with the `default-directory'.  If `default-directory'
+is a remote file name, return the list of available kernelspecs
+on the remote system.  The kernelspecs on the local system are
+returned otherwise (taking into account any currently active
+virtual environment).
+
+On any system, the list is formed by parsing the output of the
 shell command
 
-    jupyter kernelspec list
+    jupyter kernelspec list --json
 
-By default the available kernelspecs are cached. To force an
+By default the available kernelspecs are cached.  To force an
 update of the cached kernelspecs, give a non-nil value to
-REFRESH.
+REFRESH."
+  (let* ((host (or (file-remote-p default-directory) "local"))
+         (kernelspecs
+          (or (and (not refresh) (jupyter-kernelspecs-cache-get host))
+              (let ((specs
+                     (plist-get
+                      (let ((json (or (jupyter-command "kernelspec" "list"
+                                                       "--json" "--log-level" "ERROR")
+                                      (error "\
+Can't obtain kernelspecs from jupyter shell command"))))
+                        (condition-case nil
+                            (jupyter-read-plist-from-string json)
+                          (error
+                           (error "\
+Jupyter kernelspecs couldn't be parsed from
 
-If the `default-directory' is a remote directory, return the
-mapping for the remote host. In this case, each DIRECTORY in the
-kernelspec will be a remote file name with the connection
-information of the host as a prefix."
-  (let ((host (or (file-remote-p default-directory) "local")))
-    (or (and (not refresh) (gethash host jupyter--kernelspecs))
-        (let ((spec-list
-               (cdr (split-string
-                     (jupyter-command "kernelspec" "list")
-                     "\n" 'omitnull "[ \t]+")))
-              (get-kernelspec
-               (lambda (s)
-                 (cl-destructuring-bind (kernel dir)
-                     (split-string s " " 'omitnull)
-                   (unless (equal host "local")
-                     (setq dir (concat host dir)))
-                   (let ((spec (jupyter-read-kernelspec dir)))
-                     (cons kernel (cons dir spec)))))))
-          (puthash host (delq nil (mapcar get-kernelspec spec-list))
-                   jupyter--kernelspecs)))))
+    jupyter kernelspec list --json
 
-(defun jupyter-get-kernelspec (name &optional refresh)
+To investiagate further, run that command in a shell and examine
+why it isn't returning valid JSON."))))
+                      :kernelspecs)))
+                (jupyter-kernelspecs-cache-put
+                 host
+                 (sort
+                  (cl-loop
+                   for (kname spec) on specs by #'cddr
+                   for name = (substring (symbol-name kname) 1)
+                   for dir = (plist-get spec :resource_dir)
+                   collect (make-jupyter-kernelspec
+                            :name name
+                            :resource-directory (concat
+                                                 (unless (string= host "local") host)
+                                                 dir)
+                            :plist (plist-get spec :spec)))
+                  (lambda (x y)
+                    (string< (jupyter-kernelspec-name x)
+                             (jupyter-kernelspec-name y)))))))))
+    kernelspecs))
+
+(cl-defgeneric jupyter-kernelspecs (host &optional refresh)
+  "Return a list of kernelspecs on HOST.
+If REFRESH is non-nil, then refresh the list of cached
+kernelspecs first.  Otherwise a cached version of the kernelspecs
+may be returned.")
+
+(cl-defmethod jupyter-kernelspecs ((host string) &optional refresh)
+  (let ((default-directory host))
+    (jupyter-available-kernelspecs refresh)))
+
+(cl-defmethod jupyter-do-refresh-kernelspecs ()
+  (jupyter-kernelspecs default-directory 'refresh))
+
+;;;###autoload
+(defun jupyter-refresh-kernelspecs ()
+  "Refresh the list of available kernelspecs.
+Execute this command if the kernelspecs seen by Emacs is out of
+sync with those specified on your system or notebook server."
+  (interactive)
+  (message "Refreshing kernelspecs...")
+  (jupyter-do-refresh-kernelspecs)
+  (message "Refreshing kernelspecs...done"))
+
+(defun jupyter-get-kernelspec (name &optional specs refresh)
   "Get the kernelspec for a kernel named NAME.
-If no kernelspec is found, return nil. Otherwise return the
-kernelspec plist for the kernel names NAME. Optional argument
-REFRESH has the same meaning as in
-`jupyter-available-kernelspecs'."
-  (cdr (assoc name (jupyter-available-kernelspecs refresh))))
+If no kernelspec is found, return nil.  Otherwise return the
+kernelspec for the kernel named NAME.
 
-(defun jupyter-find-kernelspecs (re &optional refresh)
-  "Find all specs of kernels that have names matching matching RE.
-RE is a regular expression use to match the name of a kernel.
-Return an alist with elements of the form:
-
-    (KERNEL-NAME . (DIRECTORY . PLIST))
-
-where KERNEL-NAME is the name of a kernel that matches RE,
-DIRECTORY is the kernel's resource directory, and PLIST is the
-kernelspec propery list read from the \"kernel.json\" file in the
-resource directory.
+If SPECS is provided, it is a list of kernelspecs that will be
+searched.  Otherwise the kernelspecs associated with the
+`default-directory' are used.
 
 Optional argument REFRESH has the same meaning as in
-`jupyter-available-kernelspecs'."
-  (delq nil (mapcar (lambda (s) (and (string-match-p re (car s)) s))
-               (jupyter-available-kernelspecs refresh))))
+`jupyter-kernelspecs'."
+  (cl-loop
+   for kernelspec in (or specs (jupyter-kernelspecs default-directory refresh))
+   thereis (when (string= (jupyter-kernelspec-name kernelspec) name)
+             kernelspec)))
+
+(defun jupyter-find-kernelspecs (re &optional specs refresh)
+  "Find all specs of kernels that have names matching RE.
+RE is a regular expression use to match the name of a kernel.
+Return a list of `jupyter-kernelspec' objects.
+
+If SPECS is non-nil search SPECS, otherwise search the
+kernelspecs associated with the `default-directory'.
+
+Optional argument REFRESH has the same meaning as in
+`jupyter-kernelspecs'."
+  (cl-remove-if-not
+   (lambda (kernelspec)
+     (string-match-p re (jupyter-kernelspec-name kernelspec)))
+   (or specs (jupyter-kernelspecs default-directory refresh))))
+
+(defun jupyter-guess-kernelspec (name &optional specs refresh)
+  "Return the first kernelspec starting with NAME.
+Raise an error if no kernelspec could be found.
+
+SPECS and REFRESH have the same meaning as in
+`jupyter-find-kernelspecs'."
+  (or (car (jupyter-find-kernelspecs (format "^%s" name) specs refresh))
+      (error "No valid kernelspec for kernel name (%s)" name)))
 
 (defun jupyter-completing-read-kernelspec (&optional specs refresh)
   "Use `completing-read' to select a kernel and return its kernelspec.
-The returned kernelspec has the form
 
-    (KERNEL-NAME . (DIRECTORY . PLIST))
-
-where KERNEL-NAME is the name of the kernel, DIRECTORY is the
-resource directory of the kernel, and PLIST is the kernelspec
-plist.
-
-If SPECS is non-nil then it should be a list of kernelspecs that
-will be used to select from otherwise the list of kernelspecs
-will be taken from `jupyter-available-kernelspecs'.
+SPECS is a list of kernelspecs that will be used for completion,
+if it is nil the kernelspecs associated with the
+`default-directory' will be used.
 
 Optional argument REFRESH has the same meaning as in
-`jupyter-available-kernelspecs'."
-  (let* ((specs (or specs (jupyter-available-kernelspecs refresh)))
+`jupyter-kernelspecs'."
+  (let* ((specs (or specs (jupyter-kernelspecs default-directory refresh)))
          (display-names (if (null specs) (error "No kernelspecs available")
-                          (mapcar (lambda (k) (plist-get (cddr k) :display_name))
-                             specs)))
+                          (mapcar (lambda (k)
+                                    (plist-get
+                                     (jupyter-kernelspec-plist k)
+                                     :display_name))
+                                  specs)))
          (name (completing-read "kernel: " display-names nil t)))
     (when (equal name "")
       (error "No kernelspec selected"))
@@ -135,28 +222,51 @@ Optional argument REFRESH has the same meaning as in
             (length (member name display-names)))
          specs)))
 
-;; TODO: Define a kernel-spec mode alist mapping languages
-;; to the modes that they may use.
-(defun jupyter-kernelspecs-for-mode (&optional mode refresh)
-  "Attempt to find available kernelspecs for MODE.
-MODE should be a major mode symbol and defaults to `major-mode'.
-REFRESH has the same meaning as in
-`jupyter-available-kernelspecs'. Return a list of available
-kernelspecs or nil if none could be found. Note that this does
-not mean that no kernel exists for MODE.
+(defun jupyter-expand-environment-variables (var)
+  "Return VAR with all environment variables expanded.
+VAR is a string, if VAR contains a sequence of characters like
+${ENV_VAR}, substitute it with the value of ENV_VAR in
+`process-environment'."
+  (let ((expanded "")
+        (start 0))
+    (while (string-match "\\${\\([^}]+\\)}" var start)
+      (cl-callf concat expanded
+        (substring var start (match-beginning 0))
+        (getenv (match-string 1 var)))
+      (setq start (match-end 0)))
+    (cl-callf concat expanded (substring var start))))
 
-Currently this just concatenates the kernelspec language name
-with `-mode' to see if `major-mode' is equivalent. This is
-sufficient for `python' and `julia' kernels using their standard
-major modes, but most likely will fail for other cases."
+(defun jupyter-process-environment (kernelspec)
+  "Return a list of environment variables contained in KERNELSPEC.
+The list of environment variables have the same form as the
+entries in `process-environment'.
+
+The environment variables returned are constructed from those in
+the :env key of KERNELSPEC's property list."
   (cl-loop
-   for kernelspec in (jupyter-available-kernelspecs refresh)
-   for (_kernel . (_dir . spec)) = kernelspec
-   for language = (plist-get spec :language)
-   ;; attempt to match the major mode to a spec
-   if (eq (intern (concat language "-mode"))
-          (or mode major-mode))
-   collect kernelspec))
+   with env = (plist-get (jupyter-kernelspec-plist kernelspec) :env)
+   for (k v) on env by #'cddr
+   collect (format "%s=%s" (cl-subseq (symbol-name k) 1)
+                   (jupyter-expand-environment-variables v))))
+
+(defun jupyter-kernel-argv (kernelspec conn-file)
+  "Return a list of process arguments contained in KERNELSPEC.
+The process arguments are the ones that should be passed to
+kernel processes launched using KERNELSPEC.
+
+CONN-FILE is the file name of a connection file, containing the
+IP address and ports (among other things), a
+launched kernel should connect to."
+  (cl-loop
+   with argv = (plist-get (jupyter-kernelspec-plist kernelspec) :argv)
+   for arg in (append argv nil)
+   if (equal arg "{connection_file}")
+   collect (file-local-name conn-file)
+   else if (equal arg "{resource_dir}")
+   collect (file-local-name
+            (jupyter-kernelspec-resource-directory
+             kernelspec))
+   else collect arg))
 
 (provide 'jupyter-kernelspec)
 

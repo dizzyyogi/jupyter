@@ -1,16 +1,16 @@
 ;;; jupyter.el --- Jupyter -*- lexical-binding: t -*-
 
-;; Copyright (C) 2018 Nathaniel Nicandro
+;; Copyright (C) 2018-2024 Nathaniel Nicandro
 
 ;; Author: Nathaniel Nicandro <nathanielnicandro@gmail.com>
 ;; Created: 11 Jan 2018
-;; Version: 0.8.0
-;; Package-Requires: ((emacs "26") (zmq "0.10.3") (cl-lib "0.5") (simple-httpd "1.5.0") (websocket "1.9"))
-;; URL: https://github.com/dzop/emacs-jupyter
+;; Version: 1.0
+;; Package-Requires: ((emacs "26") (cl-lib "0.5") (org "9.1.6") (zmq "0.10.10") (simple-httpd "1.5.0") (websocket "1.9"))
+;; URL: https://github.com/emacs-jupyter/jupyter
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
-;; published by the Free Software Foundation; either version 2, or (at
+;; published by the Free Software Foundation; either version 3, or (at
 ;; your option) any later version.
 
 ;; This program is distributed in the hope that it will be useful, but
@@ -36,8 +36,8 @@
 (require 'jupyter-base)
 (require 'jupyter-client)
 (require 'jupyter-kernelspec)
+(require 'jupyter-server)
 (require 'jupyter-repl)
-(require 'jupyter-kernel-manager)
 
 (provide 'jupyter)
 

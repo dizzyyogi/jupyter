@@ -1,14 +1,13 @@
 ;;; jupyter-julia.el --- Jupyter support for Julia -*- lexical-binding: t -*-
 
-;; Copyright (C) 2018 Nathaniel Nicandro
+;; Copyright (C) 2018-2024 Nathaniel Nicandro
 
 ;; Author: Nathaniel Nicandro <nathanielnicandro@gmail.com>
 ;; Created: 23 Oct 2018
-;; Version: 0.8.0
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
-;; published by the Free Software Foundation; either version 2, or (at
+;; published by the Free Software Foundation; either version 3, or (at
 ;; your option) any later version.
 
 ;; This program is distributed in the hope that it will be useful, but
@@ -64,7 +63,9 @@
               (setcar prefix (concat "\\" (car prefix))))
              ;; Also include : to complete symbols when used as dictionary keys
              ((and (eq (char-before beg) ?:)
-                   (not (eq (char-before (1- beg)) ?:)))
+                   (not (eq (char-before (1- beg)) ?:))
+                   ;; Except for when it is part of range expressions like 1:len
+                   (not (memq (char-syntax (char-before (1- beg))) '(?w ?_))))
               (setcar prefix (concat ":" (car prefix))))))))))))
 
 (cl-defmethod jupyter-completion-post-completion (candidate
@@ -85,7 +86,7 @@
                                                       &context (jupyter-lang julia))
   "Send a help query to the Julia REPL for LINK-TEXT if URL is \"@ref\".
 If URL is \"@ref <section>\" then open a browser to the Julia
-manual for <section>. Otherwise follow the link normally."
+manual for <section>.  Otherwise follow the link normally."
   (if (string-prefix-p "@ref" url)
       (if (string= url "@ref")
           ;; Links have the form `fun`
@@ -120,21 +121,21 @@ Make the character after `point' invisible."
   "Return the Pkg prompt.
 If the Pkg prompt can't be retrieved from the kernel, return
 nil."
-  (when-let* ((msg (jupyter-wait-until-received :execute-reply
-                     (jupyter-send-execute-request jupyter-current-client
-                       :code ""
-                       :silent t
-                       :user-expressions
-                       (list :prompt "import Pkg; Pkg.REPLMode.promptf()"))
-                     ;; Longer timeout to account for initial Pkg import and
-                     ;; compilation.
-                     jupyter-long-timeout)))
-    (cl-destructuring-bind (&key prompt &allow-other-keys)
-        (jupyter-message-get msg :user_expressions)
-      (cl-destructuring-bind (&key status data &allow-other-keys)
-          prompt
-        (when (equal status "ok")
-          (plist-get data :text/plain))))))
+  (let ((prompt-code "import Pkg; Pkg.REPLMode.promptf()"))
+    (jupyter-run-with-client jupyter-current-client
+      (jupyter-mlet* ((msg
+                       (jupyter-reply
+                        (jupyter-execute-request
+                         :code ""
+                         :silent t
+                         :user-expressions (list :prompt prompt-code)))))
+        (cl-destructuring-bind (&key prompt &allow-other-keys)
+            (jupyter-message-get msg :user_expressions)
+          (cl-destructuring-bind (&key status data &allow-other-keys)
+              prompt
+            (jupyter-return
+              (when (equal status "ok")
+                (plist-get data :text/plain)))))))))
 
 (cl-defmethod jupyter-repl-after-change ((_type (eql insert)) beg _end
                                          &context (jupyter-lang julia))
@@ -170,8 +171,8 @@ nil."
 ;;; REPL font lock
 
 (defun jupyter-julia--propertize-repl-mode-char (beg end)
-  (jupyter-repl-cell-cond
-      beg end
+  (jupyter-repl-map-cells beg end
+    (lambda ()
       ;; Handle Julia package prompt so `syntax-ppss' works properly.
       (when (and (eq (char-syntax (char-after (point-min))) ?\))
                  (= (point-min)
@@ -181,20 +182,21 @@ nil."
                       ;; which is why the widen is needed here.
                       (jupyter-repl-cell-code-beginning-position))))
         (put-text-property
-         (point-min) (1+ (point-min)) 'syntax-table '(1 . ?.)))))
+         (point-min) (1+ (point-min)) 'syntax-table '(1 . ?.))))
+    #'ignore))
 
 ;;; `jupyter-repl-after-init'
 
 (defun jupyter-julia--setup-hooks (client)
-  (let ((jupyter-inhibit-handlers t))
-    (jupyter-send-execute-request client
-      :store-history nil
-      :silent t
-      ;; This is mainly for supporting the :dir header argument in `org-mode'
-      ;; source blocks. We send this after initializing the REPL and after a
-      ;; kernel restart so that we can get proper line numbers when an error
-      ;; occurs.
-      :code "\
+  (jupyter-run-with-client client
+     (jupyter-sent
+      (jupyter-execute-request
+       :handlers nil
+       :store-history nil
+       :silent t
+       ;; This is mainly for supporting the :dir header argument in
+       ;; `org-mode' source blocks.
+       :code "\
 if !isdefined(Main, :__JUPY_saved_dir)
     Core.eval(Main, :(__JUPY_saved_dir = Ref(\"\")))
     let popdir = () -> begin
@@ -206,12 +208,14 @@ if !isdefined(Main, :__JUPY_saved_dir)
         IJulia.push_posterror_hook(popdir)
         IJulia.push_postexecute_hook(popdir)
     end
-end")))
+end"))))
 
 (cl-defmethod jupyter-repl-after-init (&context (jupyter-lang julia))
-  (add-function
-   :after (local 'syntax-propertize-function)
-   #'jupyter-julia--propertize-repl-mode-char)
+  (if syntax-propertize-function
+      (add-function
+       :after (local 'syntax-propertize-function)
+       #'jupyter-julia--propertize-repl-mode-char)
+    (setq-local syntax-propertize-function #'jupyter-julia--propertize-repl-mode-char))
   (jupyter-julia--setup-hooks jupyter-current-client)
   ;; Setup hooks after restart as well
   (jupyter-add-hook jupyter-current-client 'jupyter-iopub-message-hook
